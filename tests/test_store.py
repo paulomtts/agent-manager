@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import get_args
 
 import pytest
+import eventlines
 from pydantic import ValidationError
 
 from agent_manager import models, paths, store
@@ -115,7 +116,7 @@ def test_a_resumed_store_continues_the_journal_sequence(repo):
         reopened.close()
 
     assert line.seq == 2
-    assert [line.seq for line in store_journal.Journal(RUN_ID).read()] == [1, 2]
+    assert [line.seq for line in eventlines.run_lines(RUN_ID)] == [1, 2]
 
 
 def _story() -> models.StoryRun:
@@ -153,7 +154,7 @@ def test_record_run_writes_the_journal_line_and_the_row(repo):
     finally:
         st.close()
 
-    lines = store_journal.Journal(RUN_ID).read()
+    lines = eventlines.run_lines(RUN_ID)
     assert [line.event for line in lines] == ["run_upsert"]
     assert lines[0].payload["workflow"] == "milestone"
     assert "stories" not in lines[0].payload
@@ -200,7 +201,7 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
     finally:
         st.close()
 
-    assert [line.event for line in store_journal.Journal(RUN_ID).read()] == [
+    assert [line.event for line in eventlines.run_lines(RUN_ID)] == [
         "run_upsert",
         "story_upsert",
         "subtask_upsert",
@@ -221,14 +222,23 @@ def _record_story_whose_row_write_fails(st: store_writer.Store) -> None:
         st.record_story(_story())
 
 
-def _journal_a_story_whose_row_never_landed(st: store_writer.Store) -> None:
-    """A `story_upsert` line in the journal file with neither a row nor an
-    event behind it. No `record_*` may follow it on this run: the next one
-    would take its `seq` from the events table and repeat this line's."""
+def _journal_a_story_whose_row_never_landed() -> None:
+    """A `story_upsert` line, `seq` 2, appended to the run's journal file with
+    neither a row nor an event behind it, as an `am` before 3.1.1 could have
+    left one."""
     story = _story()
-    st.journal.append(
-        "story_upsert", story.model_dump(mode="json", exclude={"subtasks"}), story=story.card_id
+    line = store_journal.JournalLine(
+        seq=2,
+        ts=datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc),
+        run_id=RUN_ID,
+        event="story_upsert",
+        story=story.card_id,
+        payload=story.model_dump(mode="json", exclude={"subtasks"}),
     )
+    path = eventlines.journal_file(RUN_ID)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(line.model_dump(mode="json"), sort_keys=True) + "\n")
 
 
 def test_a_failed_sqlite_write_leaves_neither_line_nor_event(repo):
@@ -239,7 +249,7 @@ def test_a_failed_sqlite_write_leaves_neither_line_nor_event(repo):
     _record_story_whose_row_write_fails(st)
     st.close()
 
-    lines = store_journal.Journal(RUN_ID).read()
+    lines = eventlines.run_lines(RUN_ID)
     assert [line.event for line in lines] == ["run_upsert"]
 
     reopened = store_writer.Store.open(repo, RUN_ID)
@@ -290,7 +300,7 @@ def test_run_status_transitions_replace_the_single_run_row(repo):
         st.close()
 
     assert [(row["id"], row["status"]) for row in rows] == [(RUN_ID, "done")]
-    assert len(store_journal.Journal(RUN_ID).read()) == 2
+    assert len(eventlines.run_lines(RUN_ID)) == 2
 
 
 def test_recording_a_run_writes_nothing_into_the_repo_directory(repo, tmp_path):
@@ -510,7 +520,7 @@ def test_a_journal_file_line_that_no_event_holds_is_not_rebuilt(repo):
     # Spec test 7, the inverse proof: the file is not read.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
-    _journal_a_story_whose_row_never_landed(st)
+    _journal_a_story_whose_row_never_landed()
     st.close()
 
     reopened = store_writer.Store.open(repo, RUN_ID)
@@ -972,8 +982,7 @@ def test_recording_a_run_whose_id_is_not_the_stores_run_id_is_refused(repo):
         assert st.load_run(RUN_ID) is None
     finally:
         st.close()
-    with pytest.raises(store_journal.MissingJournalError):
-        store_journal.Journal(RUN_ID).read()
+    assert eventlines.run_lines(RUN_ID) == []
 
 
 def test_events_whose_run_upsert_names_another_run_raise(repo):
@@ -1978,7 +1987,7 @@ def test_run_config_reads_the_recorded_config_and_none_for_an_absent_run(repo):
         assert store_queries.run_config(conn, "run-never-recorded") is None
     finally:
         conn.close()
-    assert store_replay.replay(store_journal.Journal(RUN_ID).read()).config == run.config
+    assert store_replay.replay(eventlines.run_lines(RUN_ID)).config == run.config
 
 
 def _on_the_writer() -> bool:
@@ -2179,7 +2188,7 @@ def test_a_failed_row_write_leaves_no_line_and_the_writer_serves_on(repo, monkey
     finally:
         st.close()
 
-    lines = store_journal.Journal(RUN_ID).read()
+    lines = eventlines.run_lines(RUN_ID)
     assert [line.event for line in lines] == ["run_upsert", "subtask_upsert"]
     assert [line.seq for line in lines] == [1, 2]
 
@@ -2192,7 +2201,7 @@ def test_a_record_on_a_closed_store_raises_and_appends_nothing(repo):
     with pytest.raises(sqlite3.ProgrammingError):
         st.record_story(_story())
 
-    lines = store_journal.Journal(RUN_ID).read()
+    lines = eventlines.run_lines(RUN_ID)
     assert [line.event for line in lines] == ["run_upsert"]
 
 
@@ -2336,7 +2345,7 @@ def test_eight_threads_recording_through_one_store_agree_with_the_rebuilt_journa
         assert total == setup_calls + (
             STRESS_WORKERS * STRESS_SUBTASKS_PER_WORKER * per_subtask
         )
-        assert [line.seq for line in st.journal.read()] == list(range(1, total + 1))
+        assert [line.seq for line in eventlines.run_lines(st.run_id)] == list(range(1, total + 1))
 
         # Read the rows BEFORE rebuilding: the rebuild rewrites them.
         before = st.load_run(RUN_ID)
@@ -3016,7 +3025,7 @@ def test_a_runs_config_story_id_round_trips_through_the_row_and_the_journal(repo
     assert json.loads(row["config"])["story_id"] == STORY_ID
     assert cleared is not None and cleared.config.story_id is None
     assert rows == 1
-    upserts = [line for line in store_journal.Journal(RUN_ID).read() if line.event == "run_upsert"]
+    upserts = [line for line in eventlines.run_lines(RUN_ID) if line.event == "run_upsert"]
     assert [line.payload["config"]["story_id"] for line in upserts] == [STORY_ID, None]
     assert all("story_id" not in line.payload for line in upserts)
 
@@ -3188,7 +3197,7 @@ def test_a_runs_config_verify_and_opt_out_round_trip_through_the_row_and_the_jou
         assert loaded.config.allow_no_verification is True
     config = json.loads(row["config"])
     assert (config["verify"], config["allow_no_verification"]) == (VERIFY, True)
-    upserts = [line for line in store_journal.Journal(RUN_ID).read() if line.event == "run_upsert"]
+    upserts = [line for line in eventlines.run_lines(RUN_ID) if line.event == "run_upsert"]
     assert upserts
     assert all(line.payload["config"]["verify"] == VERIFY for line in upserts)
     assert all(line.payload["config"]["allow_no_verification"] is True for line in upserts)
@@ -3298,7 +3307,7 @@ def test_a_story_runs_journal_names_its_story_and_milestone_at_the_head(repo):
     finally:
         st.close()
 
-    lines = store_journal.Journal(RUN_ID).read()
+    lines = eventlines.run_lines(RUN_ID)
 
     head = min(lines, key=lambda line: line.seq)
     assert head is lines[0]
@@ -3348,7 +3357,7 @@ def test_a_milestone_runs_journal_names_its_milestone_once_at_the_head(repo):
     finally:
         st.close()
 
-    lines = store_journal.Journal(RUN_ID).read()
+    lines = eventlines.run_lines(RUN_ID)
 
     assert [line.event for line in lines] == [
         "run_upsert",
@@ -3602,9 +3611,9 @@ def test_checkpoints_stay_out_of_the_journal_and_survive_a_rebuild(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        before = [line.seq for line in st.journal.read()]
+        before = [line.seq for line in eventlines.run_lines(st.run_id)]
         saved = _save_checkpoint(st, "ef248597", reason="parked")
-        after = [line.seq for line in st.journal.read()]
+        after = [line.seq for line in eventlines.run_lines(st.run_id)]
         st.rebuild_from_events(RUN_ID)
         kept = st.latest_checkpoint("ef248597")
     finally:
@@ -4300,12 +4309,12 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
         with store_db.immediate(other):
             store_leases.add_control(other, RUN_ID, lease="t1", command="cancel", requested_at=_at(1), project_id=st.project_id)
         controls = store_leases.control_requests(other, RUN_ID)
-        journal_before = [line.event for line in st.journal.read()]
+        journal_before = [line.event for line in eventlines.run_lines(st.run_id)]
 
         rebuilt = st.rebuild_from_events(RUN_ID)
 
         # Nothing journals the control tables, and the rebuild leaves them alone.
-        assert [line.event for line in st.journal.read()] == journal_before
+        assert [line.event for line in eventlines.run_lines(st.run_id)] == journal_before
         assert journal_before == ["run_upsert"]
         assert store_leases.read_lease(st.connection, RUN_ID) == lease
         assert store_leases.control_requests(st.connection, RUN_ID) == controls
@@ -4707,8 +4716,8 @@ def test_the_new_owner_continues_the_sequence(repo, stores):
     b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)  # run_seq 3
 
     assert b.record_run(_run_with_status(repo, RUN_ID, "stopped")).seq == 4
-    # The file mirrors node upserts only, so it skips the two lease events' numbers.
-    assert [line.seq for line in b.journal.read()] == [2, 4]
+    # `run_lines` holds node upserts only, so it skips the two lease events' numbers.
+    assert [line.seq for line in eventlines.run_lines(b.run_id)] == [2, 4]
 
 
 _TAKER = """
@@ -4814,7 +4823,7 @@ def test_a_taken_over_store_writes_nothing(repo, stores):
     a.record_story(_story())
     b = stores()
     b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
-    before = a.journal.path.read_bytes()
+    before = eventlines.run_lines(RUN_ID)
 
     writes = [
         lambda: a.record_run(_run_with_status(repo, RUN_ID, "done")),
@@ -4841,7 +4850,7 @@ def test_a_taken_over_store_writes_nothing(repo, stores):
         assert caught.value.holder is not None and caught.value.holder.token == "t2"
         assert a.connection.in_transaction is False
 
-    assert a.journal.path.read_bytes() == before
+    assert eventlines.run_lines(RUN_ID) == before
     # The new owner's projection is exactly what a wrote while it was the owner.
     assert store_queries.run_status(b.connection, RUN_ID) == "started"
     projected = b.load_run(RUN_ID)
@@ -4854,7 +4863,7 @@ def test_a_taken_over_store_writes_nothing(repo, stores):
     with pytest.raises(store_leases.LeaseLostError) as caught:
         a.record_run(_run(repo))
     assert caught.value.holder is None
-    assert a.journal.path.read_bytes() == before
+    assert eventlines.run_lines(RUN_ID) == before
 
 
 def test_an_unbound_store_writes_as_before(repo, stores):
@@ -5073,7 +5082,7 @@ def test_save_checkpoint_writes_the_floor_row_with_the_checkpoint(repo):
             "SELECT run_id, card_id, seq, phase, loop, source_run, floor"
             " FROM checkpoint_floors ORDER BY seq"
         ).fetchall()
-        journaled = st.journal.path.exists()
+        journaled = eventlines.journal_file(RUN_ID).exists()
     finally:
         st.close()
 
@@ -5270,9 +5279,9 @@ def test_a_rebuild_keeps_checkpoint_floors(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        before = [line.seq for line in st.journal.read()]
+        before = [line.seq for line in eventlines.run_lines(st.run_id)]
         saved = _save_floored(st, "ef248597")
-        after = [line.seq for line in st.journal.read()]
+        after = [line.seq for line in eventlines.run_lines(st.run_id)]
         st.rebuild_from_events(RUN_ID)
         kept = st.latest_checkpoint("ef248597")
         floors = _count(st, "checkpoint_floors")
@@ -5398,12 +5407,12 @@ def test_replay_events_writes_nothing(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        before = st.journal.path.read_bytes()
+        before = eventlines.run_lines(RUN_ID)
         st.connection.execute("DELETE FROM attempts")
         st.connection.commit()
         st.replay_events(RUN_ID)
         attempts = st.connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
-        after = st.journal.path.read_bytes()
+        after = eventlines.run_lines(RUN_ID)
     finally:
         st.close()
 
@@ -5453,14 +5462,16 @@ def test_replay_and_rebuild_of_its_own_run_skip_an_event_of_another_kind(repo):
 
 def test_a_resumed_store_numbers_its_next_record_from_the_events_table(repo):
     # The next `seq` is the run's `MAX(run_seq) + 1` in the events table, read
-    # inside the writing transaction: a line in the file that no event holds
-    # does not move it.
+    # inside the writing transaction: a line in a journal file that no event
+    # holds does not move it.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
-        _append_raw(st.journal, _unrecognised_line(st.journal.last_seq() + 1))
     finally:
         st.close()
+    path = eventlines.journal_file(RUN_ID)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_unrecognised_line(2)) + "\n", encoding="utf-8")
 
     reopened = store_writer.Store.open(repo, RUN_ID)
     try:
@@ -5471,7 +5482,7 @@ def test_a_resumed_store_numbers_its_next_record_from_the_events_table(repo):
 
     assert line.seq == 2
     assert [event.run_seq for event in events] == [1, 2]
-    assert [line.seq for line in store_journal.Journal(RUN_ID).read()] == [1, 2]
+    assert [line.seq for line in eventlines.run_lines(RUN_ID)] == [1, 2]
 
 
 # -- board comment outbox ----------------------------------------------------------
@@ -5583,7 +5594,7 @@ def test_enqueue_comment_inserts_once_and_never_overwrites(repo):
         )
         row = _comment_row(st.connection, "k1")
         count = st.connection.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
-        journal_exists = st.journal.path.exists()
+        journal_exists = eventlines.journal_file(RUN_ID).exists()
         project_id = st.project_id
     finally:
         st.close()
@@ -5988,7 +5999,7 @@ def test_rebuild_over_a_legacy_journal_writes_canceled_rows_and_still_agrees(rep
         st.record_run(_run(repo).model_copy(update={"status": models.LEGACY_CANCELED}))
     finally:
         st.close()
-    journal_before = store_journal.Journal(RUN_ID).path.read_bytes()
+    journal_before = eventlines.run_lines(RUN_ID)
 
     _wipe_tree_rows(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
@@ -6007,7 +6018,7 @@ def test_rebuild_over_a_legacy_journal_writes_canceled_rows_and_still_agrees(rep
         conn.close()
     assert run_row == ("canceled",)
     assert story_row == ("canceled",)
-    assert store_journal.Journal(RUN_ID).path.read_bytes() == journal_before
+    assert eventlines.run_lines(RUN_ID) == journal_before
     assert _diverging_now(repo) == []
 
 
@@ -6105,7 +6116,7 @@ def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
         st.close()
     _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
 
-    lines = store_journal.Journal(RUN_ID).read()
+    lines = eventlines.run_lines(RUN_ID)
     conn = store_db.open_db(repo)
     try:
         projection = store_queries.load_run(conn, RUN_ID)
@@ -6600,7 +6611,7 @@ def test_run_config_harness_timeouts_survive_the_journal_round_trip(repo):
     assert via_store is not None
     assert via_store.config.harness_timeout == 900.0
     assert via_store.config.harness_timeouts == {"implement": 3600.0}
-    upserts = [line for line in store_journal.Journal(RUN_ID).read() if line.event == "run_upsert"]
+    upserts = [line for line in eventlines.run_lines(RUN_ID) if line.event == "run_upsert"]
     assert upserts[0].payload["config"]["harness_timeout"] == 900.0
     assert upserts[0].payload["config"]["harness_timeouts"] == {"implement": 3600.0}
 

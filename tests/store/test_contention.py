@@ -35,13 +35,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import eventlines
 import storehelpers
 from storehelpers import hold_db, reap, release_db
 
 from agent_manager import models, paths
 from agent_manager.store import db as store_db
 from agent_manager.store import events as store_events
-from agent_manager.store import journal as store_journal
 from agent_manager.store import writer as store_writer
 
 pytestmark = pytest.mark.soak
@@ -74,9 +74,9 @@ def _events(conn: sqlite3.Connection) -> list[store_events.EventRow]:
     return store_events.read(conn, run_id=RUN_A)
 
 
-def _journal_seqs() -> list[int]:
-    """The `seq` of each line of `RUN_A`'s journal file, in `seq` order."""
-    return [line.seq for line in store_journal.Journal(RUN_A).read()]
+def _node_seqs() -> list[int]:
+    """The `run_seq` of each of `RUN_A`'s committed node events, ascending."""
+    return [line.seq for line in eventlines.run_lines(RUN_A)]
 
 
 def test_the_foreign_holder_reports_head_and_releases_on_request(repo):
@@ -271,7 +271,7 @@ def test_a_foreign_hold_inside_the_retry_budget_succeeds_after_a_retry(
     assert line.seq == 2
     assert loaded is not None
     assert [story.card_id for story in loaded.stories] == [STORY.card_id]
-    assert _journal_seqs() == [1, 2]
+    assert _node_seqs() == [1, 2]
 
 
 def test_a_foreign_hold_past_the_retry_budget_raises_store_busy_error_and_spends_no_seq(
@@ -301,7 +301,7 @@ def test_a_foreign_hold_past_the_retry_budget_raises_store_busy_error_and_spends
             held_kinds = [event.kind for event in _events(reader)]
         finally:
             reader.close()
-        held_journal = _journal_seqs()
+        held_journal = _node_seqs()
         release_db(holder)
         line = st.record_story(STORY)
         events = _events(st.read_connection)
@@ -394,7 +394,7 @@ def test_a_writer_killed_between_event_insert_and_row_write_leaves_no_partial_wr
     assert [(event.kind, event.run_seq) for event in events] == [("run_upsert", 1)]
     assert stories == 0
     assert counter == head
-    assert _journal_seqs() == [1]
+    assert _node_seqs() == [1]
 
     # One attempt with a short timeout: a lock the dead child still held
     # would raise StoreBusyError here instead of being waited out.

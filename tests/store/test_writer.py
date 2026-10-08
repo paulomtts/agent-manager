@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import eventlines
 
 from agent_manager import (
     bases,
@@ -1158,7 +1159,7 @@ def test_a_busy_re_run_of_a_record_writes_one_event_and_one_line(repo, monkeypat
     try:
         line = st.record_run(_run(repo))
         events = _events(st)
-        lines = st.journal.read()
+        lines = eventlines.run_lines(st.run_id)
         runs = _count(st, "runs")
     finally:
         st.close()
@@ -1829,7 +1830,7 @@ def test_record_jobs_never_batch(repo):
                 ],
             )
         _wait_all(callers)
-        stories = [line.event for line in st.journal.read() if line.event == "story_upsert"]
+        stories = [line.event for line in eventlines.run_lines(st.run_id) if line.event == "story_upsert"]
     finally:
         st.close()
 
@@ -1909,7 +1910,7 @@ def test_heartbeats_racing_records_all_land(repo):
         _take_t1(st)
         callers = [_Caller(work, worker) for worker in range(4)]
         _wait_all(callers)
-        lines = [line for line in st.journal.read() if line.event == "attempt_upsert"]
+        lines = [line for line in eventlines.run_lines(st.run_id) if line.event == "attempt_upsert"]
         rows = _count(st, "attempts")
         events = _events(st)
         texts = _file_texts(st)
@@ -1943,7 +1944,7 @@ def test_a_lost_lease_writes_no_line_no_event_and_no_row(repo):
             st.record_story(
                 models.StoryRun(card_id="story-a", title="Story", level=0, status="started")
             )
-        events = [line.event for line in st.journal.read()]
+        events = [line.event for line in eventlines.run_lines(st.run_id)]
         kinds = [event.kind for event in _events(st)]
         stories = _count(st, "stories")
     finally:
@@ -1988,7 +1989,7 @@ def test_concurrent_record_calls_all_land(repo):
         callers = [_Caller(record, worker) for worker in range(4)]
         for caller in callers:
             caller.wait()
-        lines = [line for line in st.journal.read() if line.event == "attempt_upsert"]
+        lines = [line for line in eventlines.run_lines(st.run_id) if line.event == "attempt_upsert"]
         rows = _count(st, "attempts")
     finally:
         st.close()
