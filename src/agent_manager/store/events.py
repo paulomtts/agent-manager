@@ -141,6 +141,47 @@ def read(
     return [_event_from_row(row) for row in conn.execute(sql, params).fetchall()]
 
 
+def read_last(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None = None,
+    before_seq: int | None = None,
+    run_id: str | None = None,
+    project_id: int | None = None,
+) -> list[EventRow]:
+    """The `limit` rows with the largest `seq` below `before_seq`, returned
+    ascending by `seq`.
+
+    `before_seq=None` means no bound; a `before_seq` of 1 or less yields `[]`.
+    `run_id` and `project_id`, when given, narrow the rows before the limit
+    counts them and are ANDed. `limit=None` means every row; a `limit` below
+    1 raises `ValueError`. A caller pages backwards by passing the first
+    `seq` of a page as the next `before_seq`. Read-only.
+    """
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit must be at least 1, got {limit}")
+    clauses: list[str] = []
+    params: list[object] = []
+    if before_seq is not None:
+        clauses.append("seq < ?")
+        params.append(before_seq)
+    if run_id is not None:
+        clauses.append("run_id = ?")
+        params.append(run_id)
+    if project_id is not None:
+        clauses.append("project_id = ?")
+        params.append(project_id)
+    sql = "SELECT * FROM events"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY seq DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [_event_from_row(row) for row in reversed(rows)]
+
+
 def head(conn: sqlite3.Connection) -> int:
     """The largest `seq` in `events`, or 0 when it has no rows. Read-only."""
     return conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0]

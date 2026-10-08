@@ -297,6 +297,7 @@ def test_events_is_a_leaf_module_of_the_store_package():
     for function in (
         store_events.insert,
         store_events.read,
+        store_events.read_last,
         store_events.head,
         store_events.has_run,
         store_events.run_lines,
@@ -306,7 +307,16 @@ def test_events_is_a_leaf_module_of_the_store_package():
     assert store_events.EventRow.__module__ == "agent_manager.store.events"
     assert inspect.ismodule(store.events)
     assert store.events is store_events
-    for name in ("insert", "read", "head", "has_run", "run_lines", "journal_line", "EventRow"):
+    for name in (
+        "insert",
+        "read",
+        "read_last",
+        "head",
+        "has_run",
+        "run_lines",
+        "journal_line",
+        "EventRow",
+    ):
         assert not hasattr(store, name)
 
 
@@ -752,6 +762,105 @@ def test_read_and_head_open_no_transaction(conns, project_id, other_project_id):
 
     store_events.read(conn, limit=2)
     store_events.head(conn)
+
+    assert not conn.in_transaction
+
+
+# ── read_last ────────────────────────────────────────────────────────────────
+
+
+def test_read_last_with_no_bound_and_no_limit_is_every_row_ascending(
+    conns, project_id, other_project_id
+):
+    """S1."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn) == rows == store_events.read(conn)
+
+
+def test_read_last_limit_is_the_last_rows_not_the_first(
+    conns, project_id, other_project_id
+):
+    """S2, Review Focus 2: an ascending `LIMIT` would return rows 1-2."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, limit=2) == [rows[3], rows[4]]
+    assert store_events.read_last(conn, limit=1) == [rows[4]]
+    assert store_events.read_last(conn, limit=10) == rows
+
+
+def test_read_last_before_seq_is_strict(conns, project_id, other_project_id):
+    """S3, Review Focus 1."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, before_seq=rows[3].seq) == rows[:3]
+
+
+def test_read_last_before_seq_with_limit_is_the_nearest_rows_before_it(
+    conns, project_id, other_project_id
+):
+    """S4."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, before_seq=rows[4].seq, limit=2) == [
+        rows[2],
+        rows[3],
+    ]
+
+
+@pytest.mark.parametrize("before_seq", [1, 0])
+def test_read_last_before_the_first_seq_is_empty(
+    conns, project_id, other_project_id, before_seq
+):
+    """S5."""
+    conn, _ = conns
+    _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, before_seq=before_seq) == []
+    assert store_events.read_last(conn, before_seq=before_seq, limit=3) == []
+
+
+def test_read_last_filters_by_run_and_project_before_limiting(
+    conns, project_id, other_project_id
+):
+    """S6, Review Focus 3: run-c's row 5 is the newest, yet run-a's last row
+    is row 4 and its last two are rows 1 and 4."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, run_id="run-a", limit=1) == [rows[3]]
+    assert store_events.read_last(conn, run_id="run-a", limit=2) == [rows[0], rows[3]]
+    assert store_events.read_last(conn, project_id=project_id, limit=2) == [
+        rows[1],
+        rows[3],
+    ]
+    assert store_events.read_last(
+        conn, run_id="run-a", project_id=project_id, limit=5
+    ) == [rows[0], rows[3]]
+    assert store_events.read_last(conn, run_id="run-c", project_id=project_id) == []
+    assert store_events.read_last(
+        conn, run_id="run-a", before_seq=rows[3].seq, limit=5
+    ) == [rows[0]]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_read_last_refuses_a_non_positive_limit(conns, limit):
+    """S7."""
+    conn, _ = conns
+    with pytest.raises(ValueError, match=f"^limit must be at least 1, got {limit}$"):
+        store_events.read_last(conn, limit=limit)
+
+
+def test_read_last_opens_no_transaction(conns, project_id, other_project_id):
+    conn, _ = conns
+    _five_rows(conn, project_id, other_project_id)
+    assert not conn.in_transaction
+
+    store_events.read_last(conn, limit=2, before_seq=4, run_id="run-a")
 
     assert not conn.in_transaction
 
