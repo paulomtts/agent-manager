@@ -298,6 +298,7 @@ def test_events_is_a_leaf_module_of_the_store_package():
         store_events.insert,
         store_events.read,
         store_events.read_last,
+        store_events.read_escalations,
         store_events.head,
         store_events.has_run,
         store_events.run_lines,
@@ -311,6 +312,7 @@ def test_events_is_a_leaf_module_of_the_store_package():
         "insert",
         "read",
         "read_last",
+        "read_escalations",
         "head",
         "has_run",
         "run_lines",
@@ -992,5 +994,177 @@ def test_run_lines_open_no_transaction(conns, project_id):
     conn.commit()
 
     store_events.run_lines(conn, "run-a")
+
+    assert not conn.in_transaction
+
+
+# ── read_escalations ─────────────────────────────────────────────────────────
+
+
+def _escalation_mix(conn, project_id, other_project_id) -> list[store_events.EventRow]:
+    """Ten rows of three runs in two projects; only indexes 1, 4 and 7 are
+    escalations (a `run_upsert` whose `status` is `"escalated"`). Every other
+    node kind also says `"escalated"`, and so does a non-node kind."""
+    specs = [
+        ("run-a", project_id, "run_upsert", {"status": "running"}),
+        ("run-a", project_id, "run_upsert", {"status": "escalated"}),
+        ("run-a", project_id, "story_upsert", {"status": "escalated"}),
+        ("run-b", other_project_id, "subtask_upsert", {"status": "escalated"}),
+        ("run-b", other_project_id, "run_upsert", {"status": "escalated"}),
+        ("run-b", other_project_id, "phase_upsert", {"status": "escalated"}),
+        ("run-c", project_id, "attempt_upsert", {"status": "escalated"}),
+        ("run-c", project_id, "run_upsert", {"status": "escalated"}),
+        ("run-c", project_id, "run_upsert", {"status": "done"}),
+        ("run-a", project_id, "lease_acquired", {"status": "escalated"}),
+    ]
+    rows = [
+        _insert(conn, project, run_id=run, kind=kind, payload=payload)
+        for run, project, kind, payload in specs
+    ]
+    conn.commit()
+    return rows
+
+
+def test_read_escalations_are_only_run_upserts_whose_status_is_escalated(
+    conns, project_id, other_project_id
+):
+    """Spec test 1, Review focus 1: other node kinds saying "escalated" are not."""
+    conn, _ = conns
+    rows = _escalation_mix(conn, project_id, other_project_id)
+
+    assert store_events.read_escalations(conn) == [rows[1], rows[4], rows[7]]
+
+
+def test_read_escalations_span_projects_unless_one_is_named(
+    conns, project_id, other_project_id
+):
+    """Spec test 2."""
+    conn, _ = conns
+    rows = _escalation_mix(conn, project_id, other_project_id)
+
+    assert store_events.read_escalations(conn, project_id=None) == [
+        rows[1],
+        rows[4],
+        rows[7],
+    ]
+    assert store_events.read_escalations(conn, project_id=project_id) == [
+        rows[1],
+        rows[7],
+    ]
+    assert store_events.read_escalations(conn, project_id=other_project_id) == [rows[4]]
+    assert store_events.read_escalations(conn, project_id=other_project_id + 100) == []
+
+
+def test_read_escalations_after_seq_is_strict(conns, project_id, other_project_id):
+    """Spec test 3."""
+    conn, _ = conns
+    rows = _escalation_mix(conn, project_id, other_project_id)
+
+    assert store_events.read_escalations(conn, after_seq=rows[1].seq - 1) == [
+        rows[1],
+        rows[4],
+        rows[7],
+    ]
+    assert store_events.read_escalations(conn, after_seq=rows[1].seq) == [rows[4], rows[7]]
+    assert store_events.read_escalations(conn, after_seq=rows[7].seq) == []
+    assert store_events.read_escalations(conn, after_seq=rows[-1].seq + 10) == []
+
+
+def test_read_escalations_limit_counts_escalations_only(conns, project_id):
+    """Spec test 4, Review focus 2: twenty rows that are not escalations come
+    first and use up none of the limit."""
+    conn, _ = conns
+    for n in range(20):
+        _insert(conn, project_id, kind="run_upsert", payload={"status": "running", "n": n})
+    escalations = [
+        _insert(conn, project_id, run_id=run, kind="run_upsert", payload={"status": "escalated"})
+        for run in ("run-x", "run-y", "run-z")
+    ]
+    conn.commit()
+
+    assert store_events.read_escalations(conn, limit=2) == escalations[:2]
+    assert store_events.read_escalations(
+        conn, after_seq=escalations[0].seq, limit=1
+    ) == [escalations[1]]
+    assert store_events.read_escalations(conn, limit=10) == escalations
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_read_escalations_refuse_a_non_positive_limit(conns, limit):
+    """Spec test 4."""
+    conn, _ = conns
+    with pytest.raises(ValueError, match="limit"):
+        store_events.read_escalations(conn, limit=limit)
+
+
+def test_read_escalations_return_every_row_of_a_run_escalated_twice(conns, project_id):
+    """Spec test 5, Review focus 5: one row per record, not one per run."""
+    conn, _ = conns
+    first = _insert(conn, project_id, kind="run_upsert", payload={"status": "escalated"})
+    _insert(conn, project_id, kind="phase_upsert", payload={"status": "running"})
+    second = _insert(
+        conn, project_id, kind="run_upsert", payload={"status": "escalated", "note": "again"}
+    )
+    conn.commit()
+
+    assert store_events.read_escalations(conn) == [first, second]
+    assert store_events.read_escalations(conn, after_seq=first.seq) == [second]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"status": None},
+        {"status": "Escalated"},
+        {"status": "ESCALATED"},
+        {"status": "escalated "},
+        {"status": ["escalated"]},
+        {"status": {"value": "escalated"}},
+        {"status": True},
+        {"run": {"status": "escalated"}},
+    ],
+    ids=[
+        "no-status",
+        "null",
+        "capitalised",
+        "upper",
+        "trailing-space",
+        "list",
+        "object",
+        "bool",
+        "nested",
+    ],
+)
+def test_read_escalations_match_the_status_exactly(conns, project_id, payload):
+    """Spec test 6: only the top-level string "escalated" matches; the
+    escalation after it shows the read is not empty."""
+    conn, _ = conns
+    _insert(conn, project_id, kind="run_upsert", payload=payload)
+    match = _insert(
+        conn, project_id, run_id="run-b", kind="run_upsert", payload={"status": "escalated"}
+    )
+    conn.commit()
+
+    assert store_events.read_escalations(conn) == [match]
+
+
+def test_read_escalations_skip_a_row_whose_payload_is_not_json(conns, project_id):
+    """Plan Review Focus 1: one corrupt row does not stop the read."""
+    conn, _ = conns
+    _raw_node_row(conn, project_id, run_seq=1, payload="{not json")
+    match = _insert(
+        conn, project_id, run_id="run-b", kind="run_upsert", payload={"status": "escalated"}
+    )
+    conn.commit()
+
+    assert store_events.read_escalations(conn) == [match]
+
+
+def test_read_escalations_open_no_transaction(conns, project_id, other_project_id):
+    conn, _ = conns
+    _escalation_mix(conn, project_id, other_project_id)
+
+    store_events.read_escalations(conn, after_seq=1, limit=2, project_id=project_id)
 
     assert not conn.in_transaction

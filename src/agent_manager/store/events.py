@@ -182,6 +182,45 @@ def read_last(
     return [_event_from_row(row) for row in reversed(rows)]
 
 
+def read_escalations(
+    conn: sqlite3.Connection,
+    *,
+    after_seq: int = 0,
+    limit: int | None = None,
+    project_id: int | None = None,
+) -> list[EventRow]:
+    """The escalation events with `seq > after_seq`, ascending by `seq`, at
+    most `limit` of them.
+
+    An escalation event is a `run_upsert` row whose payload's top-level
+    `status` is exactly the string `"escalated"`. This is the one definition
+    of it. A node of any other kind saying `"escalated"` is not one, matching
+    is case-sensitive, and a payload that is not JSON is never a match (it is
+    skipped, not an error). Every matching row is returned, so a run recorded
+    twice while escalated yields two rows. `project_id`, when given, narrows
+    the rows before the limit counts them; with none, every project's.
+    `limit=None` means no limit; a `limit` below 1 raises `ValueError`.
+    Read-only.
+    """
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit must be at least 1, got {limit}")
+    clauses = [
+        "seq > ?",
+        "kind = 'run_upsert'",
+        "CASE WHEN json_valid(payload) THEN json_extract(payload, '$.status') END"
+        " = 'escalated'",
+    ]
+    params: list[object] = [after_seq]
+    if project_id is not None:
+        clauses.append("project_id = ?")
+        params.append(project_id)
+    sql = "SELECT * FROM events WHERE " + " AND ".join(clauses) + " ORDER BY seq"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return [_event_from_row(row) for row in conn.execute(sql, params).fetchall()]
+
+
 def head(conn: sqlite3.Connection) -> int:
     """The largest `seq` in `events`, or 0 when it has no rows. Read-only."""
     return conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0]
