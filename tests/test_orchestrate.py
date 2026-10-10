@@ -46,6 +46,7 @@ import pytest
 from typer.testing import CliRunner
 
 from lockhelpers import _holder, _probe, _reap
+import eventlines
 
 from agent_manager import bases, board, census, cli, comments, control, dag, detach, errors, integration, locks, models, orchestrate, paths, runs
 from agent_manager.runtime import engine as runtime_engine
@@ -5538,9 +5539,9 @@ def test_a_cancelled_milestone_records_cancelled_and_skips_integrate(
 
 
 def _run_upserts(run_id: str) -> list[str]:
-    """The raw `run_upsert` lines of `run_id`'s journal, in order."""
-    raw = (paths.run_dir(run_id) / "journal.jsonl").read_text(encoding="utf-8")
-    return [line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"]
+    """The raw `run_upsert` lines of `run_id`'s node events, in order."""
+    raw = eventlines.run_line_texts(run_id)
+    return [line for line in raw if json.loads(line)["event"] == "run_upsert"]
 
 
 def _raw_run_status(project: Path, run_id: str) -> str:

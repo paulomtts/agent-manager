@@ -3,8 +3,7 @@ thread that drains a FIFO queue, under the lease fence. A job runs in a
 `BEGIN IMMEDIATE` transaction of its own, except that jobs which may batch and
 wait in the queue together share one transaction, each inside a savepoint of
 its own. Reads run on a separate read connection. A `record_*` writes an event
-and the row it explains in one transaction; after the commit the event is
-mirrored to the run's journal file, best-effort.
+and the row it explains in one transaction, and nothing outside the database.
 """
 
 import json
@@ -96,25 +95,23 @@ def _main_file(conn: sqlite3.Connection) -> str:
 
 
 class Store:
-    """A run's projection rows and the events that explain them, with the run's
-    journal file kept as their mirror.
+    """A run's projection rows and the events that explain them.
 
     Every `record_*` inserts an `events` row and writes the row it explains in
-    one transaction, then mirrors the event to the journal file after the
-    commit. There is deliberately no public method that writes a tree row on
-    its own. The exceptions are `checkpoints` (pygents spec §6),
+    one transaction. There is deliberately no public method that writes a tree
+    row on its own. The exceptions are `checkpoints` (pygents spec §6),
     `checkpoint_floors` (exactly-once 1.1), `run_controls` and `run_leases`
     (live control C1/C2), `run_claims` (multi-process X5) and
-    `board_comments` (board-comments B6): the six row-only tables, which have
-    no journal and are the projection's alone. Every row this store writes
-    carries its `project_id`. Their methods never touch the journal file, and
-    `rebuild_from_events` leaves those rows alone. The lease and control
-    writes still record their facts as events (card 1.2.7): `take_lease`
-    inserts `lease_acquired` or `lease_taken_over` in its transaction, a
-    refused take records `claim_conflict` in a job of its own after the
-    rollback, and `mark_control_handled` inserts `control_handled` with the
-    mark. Those events take `run_seq` numbers like any other and are never
-    mirrored, so the journal file skips them.
+    `board_comments` (board-comments B6): the six row-only tables, which no
+    node event explains and which are the projection's alone. Every row this
+    store writes carries its `project_id`, and `rebuild_from_events` leaves
+    the row-only tables alone. The lease and control writes still record their
+    facts as events (card 1.2.7): `take_lease` inserts `lease_acquired` or
+    `lease_taken_over` in its transaction, a refused take records
+    `claim_conflict` in a job of its own after the rollback, and
+    `mark_control_handled` inserts `control_handled` with the mark. Those
+    events take `run_seq` numbers like any other. A store writes nothing
+    outside the database: no run directory and no journal file.
 
     The threads of the process holding a run's lease share one `Store`. Every
     write is one job on the store's single writer thread, run in the order it
@@ -124,25 +121,24 @@ class Store:
     each inside a savepoint of its own, so one that raises fails only its own
     caller; every other write has a transaction of its own. The calling
     thread blocks until its job's transaction has committed or given up and
-    gets the job's result or exception. A `record_*` job mirrors its line
-    before the next job starts, so the file lists a store's lines in `run_seq`
-    order. Once `take_lease` or `adopt_lease` has bound a token, every run
-    write first checks, inside its transaction, that the token still holds the
-    lease (multi-process X4). Reads run on the calling thread, on a separate
-    read-only connection: they see only committed rows and never wait for a
-    write. A process forked while a `Store` is open gets an inert copy of it:
-    every write and read raises `sqlite3.ProgrammingError`, and `close`
-    touches neither connection, so the child opens a `Store` of its own.
+    gets the job's result or exception. Once `take_lease` or `adopt_lease` has
+    bound a token, every run write first checks, inside its transaction, that
+    the token still holds the lease (multi-process X4). Reads run on the
+    calling thread, on a separate read-only connection: they see only
+    committed rows and never wait for a write. A process forked while a
+    `Store` is open gets an inert copy of it: every write and read raises
+    `sqlite3.ProgrammingError`, and `close` touches neither connection, so the
+    child opens a `Store` of its own.
     """
 
     def __init__(
         self,
         conn: sqlite3.Connection,
-        journal: store_journal.Journal,
+        run_id: str,
         project_id: int,
     ) -> None:
         self._conn = conn
-        self._journal = journal
+        self._run_id = run_id
         self._project_id = project_id
         self._token: str | None = None
         self._jobs: queue.SimpleQueue[_Job | None] = queue.SimpleQueue()
@@ -157,12 +153,14 @@ class Store:
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Store":
-        """A store on `root`'s projection, bound to `root`'s `projects` row.
+        """A store of `run_id` on `root`'s projection, bound to `root`'s
+        `projects` row.
 
         The row is resolved, or created on first sight, and committed before
         the store exists, so every run of one project shares one id. The
         wall clock is read here for the row's `created_at`, as a `record_*`
-        reads it for its event's `ts`.
+        reads it for its event's `ts`. Nothing is created under the data
+        directory's `runs/`.
         """
         conn = store_db.open_db(root)
         try:
@@ -173,7 +171,7 @@ class Store:
         except BaseException:
             conn.close()
             raise
-        return cls(conn, store_journal.Journal(run_id), project_id)
+        return cls(conn, run_id, project_id)
 
     @property
     def project_id(self) -> int:
@@ -182,11 +180,8 @@ class Store:
 
     @property
     def run_id(self) -> str:
-        return self._journal.run_id
-
-    @property
-    def journal(self) -> store_journal.Journal:
-        return self._journal
+        """The run every `record_*` and fenced write of this store is about."""
+        return self._run_id
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -441,8 +436,7 @@ class Store:
     # run's highest `run_seq` inside it. A store whose lease was lost raises
     # `LeaseLostError` before inserting. If the row write raises, the
     # exception propagates unchanged and neither the event nor the row is
-    # committed, so no `run_seq` is spent. After the commit the event is
-    # mirrored to the journal file (`_mirror`).
+    # committed, so no `run_seq` is spent.
 
     def _insert_event(
         self,
@@ -459,8 +453,7 @@ class Store:
         job's transaction.
 
         Numbered one past the run's highest `run_seq`; `ts` is the wall clock
-        read now, inside the job, so a busy re-run reads it again. Nothing is
-        mirrored here: only `_record` mirrors, after its commit.
+        read now, inside the job, so a busy re-run reads it again.
         """
         return store_events.insert(
             conn,
@@ -488,14 +481,12 @@ class Store:
         phase: str | None = None,
         attempt: int | None = None,
     ) -> store_journal.JournalLine:
-        """Insert `kind`'s event, run `write_row`, commit, then mirror the line.
+        """Insert `kind`'s event and run `write_row` in one fenced job, and
+        return the committed event as `store_events.journal_line` gives it.
 
         The event's `ts` is the wall clock read inside the job. A busy re-run
-        starts the job over, and only the committed attempt's line is
-        mirrored. Returns the line the committed event mirrors to, whether or
-        not the mirror reached the file.
+        starts the job over, so the line returned is the committed attempt's.
         """
-        committed: list[store_journal.JournalLine] = []
 
         def job(conn: sqlite3.Connection) -> store_journal.JournalLine:
             event = self._insert_event(
@@ -508,36 +499,9 @@ class Store:
                 attempt=attempt,
             )
             write_row(conn)
-            committed[:] = [store_events.journal_line(event)]
-            return committed[0]
+            return store_events.journal_line(event)
 
-        return self._submit(
-            job,
-            operation=operation,
-            fenced=True,
-            after_commit=lambda: self._mirror(committed[0]),
-        )
-
-    def _mirror(self, line: store_journal.JournalLine) -> None:
-        """Append `line` to the run's journal file: the `after_commit` of every
-        `record_*`, run once its event and row are committed.
-
-        Best-effort: an `Exception` from the append is logged as a warning
-        naming the run, the line's `seq` and its event, and is not raised, so
-        the file lacks that `seq`. Anything else that is a `BaseException`
-        propagates.
-        """
-        try:
-            self._journal.mirror(line)
-        except Exception:
-            _log.warning(
-                "run %s: event %d (%s) is committed but its journal file line"
-                " was not written",
-                line.run_id,
-                line.seq,
-                line.event,
-                exc_info=True,
-            )
+        return self._submit(job, operation=operation, fenced=True)
 
     def record_run(self, run: models.Run) -> store_journal.JournalLine:
         def write_row(conn: sqlite3.Connection) -> None:
@@ -793,9 +757,9 @@ class Store:
 
     # -- checkpoints ---------------------------------------------------------
     #
-    # A row-only table outside the journal (pygents spec §6, G10): nothing here
-    # calls `self._journal`. Each write is one fenced job, so `seq` is read and
-    # the row written in one transaction with no other write between.
+    # A row-only table no event explains (pygents spec §6, G10). Each write is
+    # one fenced job, so `seq` is read and the row written in one transaction
+    # with no other write between.
 
     def save_checkpoint(
         self,
@@ -881,9 +845,9 @@ class Store:
 
     # -- board comment outbox ------------------------------------------------
     #
-    # A row-only table outside the journal (board-comments B6, B9): nothing
-    # here calls `self._journal`, and `rebuild_from_events` leaves the rows
-    # alone. Every writer is one fenced job, like `save_checkpoint`. Posting
+    # A row-only table no event explains (board-comments B6, B9):
+    # `rebuild_from_events` leaves the rows alone. Every writer is one fenced
+    # job, like `save_checkpoint`. Posting
     # to the board is not this module's job: `comments.py` drains the outbox
     # through `board.py`.
 
@@ -966,13 +930,12 @@ class Store:
 
     # -- leases, claims and control requests -----------------------------------
     #
-    # Row-only tables outside the journal (live control C2, multi-process X5):
-    # nothing here calls `self._journal`, and `rebuild_from_events` leaves the
-    # rows alone. `take_lease` and `mark_control_handled` insert their event
-    # (`lease_acquired`/`lease_taken_over`, `control_handled`) in the same
-    # transaction as the rows, and a refused take records `claim_conflict`
-    # afterwards; none of those events reaches the journal file, and every
-    # other method here writes none. `take_lease` is the only check-and-set;
+    # Row-only tables no node event explains (live control C2, multi-process
+    # X5): `rebuild_from_events` leaves the rows alone. `take_lease` and
+    # `mark_control_handled` insert their event (`lease_acquired`/
+    # `lease_taken_over`, `control_handled`) in the same transaction as the
+    # rows, and a refused take records `claim_conflict` afterwards; every
+    # other method here writes no event. `take_lease` is the only check-and-set;
     # every other method touches only the rows whose token matches, and any
     # other token is a silent no-op.
 
@@ -997,8 +960,7 @@ class Store:
         was displaced, `lease_taken_over` (naming the displaced row) otherwise,
         even under the same token. Any raise rolls all of it back and leaves
         the bound token as it was. On success, after the commit and before any
-        other job runs, the store is bound to `token`. The event is never
-        mirrored to the journal file. A refusal is recorded as a
+        other job runs, the store is bound to `token`. A refusal is recorded as a
         `claim_conflict` event by a second job (`_record_claim_conflict`), then
         the same exception object is raised.
         """

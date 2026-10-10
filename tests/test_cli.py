@@ -15,6 +15,7 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 import asyncio
 import dataclasses
 import io
+import importlib.util
 import inspect
 import json
 import os
@@ -34,6 +35,7 @@ from types import SimpleNamespace
 from typing import Any, get_args
 
 import pytest
+import eventlines
 import typer
 from typer.testing import CliRunner
 
@@ -48,6 +50,7 @@ from agent_manager import (
     detach,
     dispatch,
     errors,
+    export,
     integration,
     locks,
     models,
@@ -2137,11 +2140,11 @@ def test_no_run_artifact_is_written_inside_the_repository(project, cards):
     # would pass on nothing.
     assert porcelain, "the run's own worktree should show up as untracked"
     assert all(".claude" in line or ".brd" in line for line in porcelain), porcelain
-    assert (paths.run_dir(payload["run_id"]) / "journal.jsonl").is_file()
+    assert not eventlines.journal_file(payload["run_id"]).exists()
 
 
 @pytest.mark.git
-def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
+def test_the_events_open_with_the_run_story_and_subtask_lines(project, cards):
     payload = cli.run_card(
         cards["subtask"],
         repo_dir=project,
@@ -2150,7 +2153,7 @@ def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
-    lines = store_journal.Journal(payload["run_id"]).read()
+    lines = eventlines.run_lines(payload["run_id"])
     assert [line.event for line in lines[:3]] == [
         "run_upsert",
         "story_upsert",
@@ -9407,8 +9410,8 @@ def test_a_task_resume_without_verify_hands_the_walk_the_recorded_suite(
 
 
 def _run_upserts(run_id: str) -> list[Any]:
-    """Every `run_upsert` line of `run_id`'s journal, oldest first."""
-    return [line for line in store_journal.Journal(run_id).read() if line.event == "run_upsert"]
+    """Every `run_upsert` node event of `run_id`, oldest first."""
+    return [line for line in eventlines.run_lines(run_id) if line.event == "run_upsert"]
 
 
 @pytest.mark.git
@@ -11213,10 +11216,8 @@ def test_card_cancel_journals_canceled(project, cards, control_applied):
 
     run_id = _controlled_card_run(project, cards, factory)["run_id"]
 
-    raw = (paths.run_dir(run_id) / "journal.jsonl").read_text(encoding="utf-8")
-    upserts = [
-        line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"
-    ]
+    raw = eventlines.run_line_texts(run_id)
+    upserts = [line for line in raw if json.loads(line)["event"] == "run_upsert"]
     assert upserts, raw
     assert json.loads(upserts[-1])["payload"]["status"] == "canceled", upserts[-1]
     assert not [line for line in upserts if "cancelled" in line], upserts
@@ -11658,11 +11659,11 @@ def test_a_card_run_is_refused_while_another_live_run_claims_the_card(
 
 
 @pytest.mark.git
-def test_a_claim_taken_after_the_preflight_is_refused_with_only_an_empty_run_dir(
+def test_a_claim_taken_after_the_preflight_is_refused_leaving_no_run_dir(
     project, cards, monkeypatch
 ):
     """Review Focus 1: the preflight passed, then another run claimed the card
-    before `take_lease`; the only leftover is the empty run directory."""
+    before `take_lease`; nothing is left under `runs/`."""
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     key = control.card_claim(cards["subtask"])
@@ -11682,8 +11683,7 @@ def test_a_claim_taken_after_the_preflight_is_refused_with_only_an_empty_run_dir
     error = json.loads(result.stdout)["error"]
     assert error["type"] == "ClaimedError"
     assert error["message"].startswith(f"card {cards['subtask']} is being driven by run {OTHER_RUN_ID}")
-    (run_dir,) = _run_dirs()
-    assert list(run_dir.iterdir()) == []
+    assert _run_dirs() == []
     assert _recorded_run_ids(project) == []
     assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
 
@@ -12014,7 +12014,7 @@ def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     _plant_lease(project, run_id=run_id, token="racer", heartbeat_at=now - timedelta(seconds=5))
-    before = (_attempt_rows(project), _checkpoint_rows(project), store_journal.Journal(run_id).read())
+    before = (_attempt_rows(project), _checkpoint_rows(project), eventlines.run_lines(run_id))
 
     with pytest.raises(cli.RunIsLiveError) as caught:
         _resume_card_run(project, run_id, _Forbidden("runner_factory"))
@@ -12027,7 +12027,7 @@ def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     assert (
         _attempt_rows(project),
         _checkpoint_rows(project),
-        store_journal.Journal(run_id).read(),
+        eventlines.run_lines(run_id),
     ) == before
     lease = _card_lease(project, run_id)
     assert lease is not None and lease.token == "racer"
@@ -12429,6 +12429,30 @@ def test_watch_run_known_only_by_lease_events_is_listed(projection):
     )
 
     assert _watch_data(EVENTS_RUN_A) == {"events": [_watch_event(row) for row in rows]}
+
+
+def test_events_watch_and_export_serve_a_run_with_no_journal_file(projection, tmp_path):
+    """3.1.1 B3: a run recorded after the live journal was retired has events
+    and no journal file; `events`, `watch` and `export` read `am.db` only."""
+    _record(projection, EVENTS_RUN_A, started_at=RECORDED_AT, with_phases=False)
+    assert not eventlines.journal_file(EVENTS_RUN_A).exists()
+    reader = store_db.open_reader(paths.db_path())
+    try:
+        rows = store_events.read(reader, run_id=EVENTS_RUN_A)
+    finally:
+        reader.close()
+    assert [row.kind for row in rows] == ["run_upsert", "story_upsert", "subtask_upsert"]
+    out = tmp_path / "export.jsonl"
+
+    listed = _events([EVENTS_RUN_A])["events"]
+    watched = _watch_data(EVENTS_RUN_A)
+    exported = runner.invoke(cli.app, ["export", EVENTS_RUN_A, "--out", str(out)])
+
+    assert listed == [_watch_event(row) for row in rows]
+    assert watched == {"events": [_watch_event(row) for row in rows]}
+    assert exported.exit_code == 0, exported.output
+    assert out.read_text(encoding="utf-8") == "".join(export.line(row) + "\n" for row in rows)
+    assert not eventlines.journal_file(EVENTS_RUN_A).exists()
 
 
 @pytest.mark.parametrize("run_id", ["../escape", "a/b", ".", "..", ""])
@@ -13176,7 +13200,8 @@ def _invoke_reset(root: Path, run_id: str = CONTROL_RUN_ID, *extra: str):
 
 
 def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_journal.JournalLine]:
-    return store_journal.Journal(run_id).read()
+    """`run_id`'s committed node events, ascending by `run_seq`."""
+    return eventlines.run_lines(run_id)
 
 
 def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
@@ -14698,22 +14723,19 @@ def test_reset_closes_a_run_that_never_saved_a_checkpoint(projection):
 
 
 def test_reset_journals_canceled(projection):
-    """The `run_upsert` the reset appends carries `canceled` in the raw
-    `journal.jsonl`, and no line it writes carries the legacy spelling."""
+    """The `run_upsert` the reset records carries `canceled` in its raw line,
+    and no line it writes carries the legacy spelling."""
     _plant_run(projection, status="stopped")
-    journal = paths.run_dir(CONTROL_RUN_ID) / "journal.jsonl"
-    count_before = len(journal.read_text(encoding="utf-8").splitlines())
+    count_before = len(eventlines.run_line_texts(CONTROL_RUN_ID))
 
     result = _invoke_reset(projection)
 
     assert result.exit_code == 0, result.output
-    raw = journal.read_text(encoding="utf-8")
-    upserts = [
-        line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"
-    ]
+    raw = eventlines.run_line_texts(CONTROL_RUN_ID)
+    upserts = [line for line in raw if json.loads(line)["event"] == "run_upsert"]
     assert upserts, raw
     assert json.loads(upserts[-1])["payload"]["status"] == "canceled", upserts[-1]
-    written = raw.splitlines()[count_before:]
+    written = raw[count_before:]
     assert len(written) == 1, written
     assert not [line for line in written if "cancelled" in line], written
 
@@ -15120,24 +15142,29 @@ def test_reset_rereads_the_status_under_the_lease_and_never_overwrites_done(
     assert _lease(projection) is None
 
 
-def test_reset_of_a_run_whose_journal_is_torn_mid_file_is_an_envelope(projection):
-    """Spec test 9: `Store.open` reads the journal's highest `seq`, and a
-    non-JSON line in its middle is `CorruptJournalError` -- a refusal at
-    exit 3, not a traceback."""
+def test_reset_of_a_run_whose_journal_is_torn_mid_file_succeeds_and_leaves_the_file(
+    projection,
+):
+    """3.1.1 B2: a journal file an `am` before 3.1.1 left, torn in its middle,
+    is no longer read. `am reset` closes the run as it would one with no file,
+    and the file keeps every byte."""
     _plant_run(projection, status="stopped")
-    path = store_journal.Journal(CONTROL_RUN_ID).path
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    path.write_text(lines[0] + "{torn\n" + "".join(lines[1:]), encoding="utf-8")
+    texts = eventlines.run_line_texts(CONTROL_RUN_ID)
+    path = eventlines.journal_file(CONTROL_RUN_ID)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        texts[0] + "\n{torn\n" + "".join(text + "\n" for text in texts[1:]),
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
 
     result = _invoke_reset(projection)
 
-    assert result.exit_code == cli.EXIT_ERROR, result.output
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "CorruptJournalError"
-    assert f"{path}:2:" in envelope["error"]["message"]
-    assert _recorded_status(projection) == "stopped"
-    assert _lease(projection) is None
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert (data["previous_status"], data["status"]) == ("stopped", "canceled")
+    assert _recorded_status(projection) == "canceled"
+    assert path.read_bytes() == before
 
 
 def test_handled_takes_a_corrupt_journal_but_not_every_journal_error():
@@ -15245,12 +15272,6 @@ RUN_CANCELLED_BY_HAND = {
 }
 """What `_plant_run` (journaled `started`) reports after `_hand_edit_run_status(..., "cancelled")`:
 the hand-edited legacy spelling reads back as `canceled`."""
-
-
-def _journal_path(run_id: str = CONTROL_RUN_ID) -> Path:
-    """The run's journal file, located without `Journal(run_id)`, which would
-    create the run directory."""
-    return paths.data_dir() / "runs" / run_id / store_journal.JOURNAL_NAME
 
 
 def _hand_edit_run_status(root: Path, status: str, run_id: str = CONTROL_RUN_ID) -> None:
@@ -15405,23 +15426,21 @@ def test_status_reports_a_run_hand_edited_to_cancelled_as_one_foreign_mismatch(
     assert _controls(projection) == []
 
 
-def test_the_integrity_check_writes_no_row_and_no_journal_byte(projection, monkeypatch):
-    """Spec test 3: every table and the journal's bytes are identical after a
-    `status` that found and reported a mismatch."""
+def test_the_integrity_check_writes_no_row_and_no_file(projection, monkeypatch):
+    """Spec test 3: every table is identical, and nothing appears under
+    `runs/`, after a `status` that found and reported a mismatch."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
     _hand_edit_run_status(projection, "cancelled")
     tables_before = _projection_snapshot(projection)
-    journal_before = _journal_path().read_bytes()
-    runs_before = sorted(p.name for p in (paths.data_dir() / "runs").iterdir())
+    assert not (paths.data_path() / "runs").exists()
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"]["checked"] is True
     assert data["integrity"]["mismatches"] == [RUN_CANCELLED_BY_HAND]
     assert _projection_snapshot(projection) == tables_before
-    assert _journal_path().read_bytes() == journal_before
-    assert sorted(p.name for p in (paths.data_dir() / "runs").iterdir()) == runs_before
+    assert not (paths.data_path() / "runs").exists()
 
 
 def test_status_of_a_run_with_no_events_says_so_and_never_opens_a_journal(
@@ -15431,14 +15450,13 @@ def test_status_of_a_run_with_no_events_says_so_and_never_opens_a_journal(
     _freeze_clock(monkeypatch)
     _plant_run(projection)
     run_dir = paths.data_dir() / "runs" / CONTROL_RUN_ID
-    shutil.rmtree(run_dir)
+    assert not run_dir.exists()
     _drop_events(projection)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("status must not construct a Journal")
 
     monkeypatch.setattr(store_journal.Journal, "__init__", forbidden)
-    monkeypatch.setattr(store_journal.Journal, "_for_reading", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
@@ -15452,7 +15470,7 @@ def test_status_of_a_clean_run_with_its_journal_file_gone_is_still_checked_clean
     """Spec test 17: the events, not the file, are compared."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    shutil.rmtree(paths.data_dir() / "runs" / CONTROL_RUN_ID)
+    assert not (paths.data_dir() / "runs" / CONTROL_RUN_ID).exists()
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
@@ -18416,3 +18434,30 @@ def test_run_agent_phases_follow_the_run_shape():
     assert cli.run_agent_phases(run("task")) == cli.TASK_AGENT_PHASES
     assert cli.run_agent_phases(run("milestone", "story-1")) == cli.TASK_AGENT_PHASES
     assert cli.run_agent_phases(run("milestone")) == cli.MILESTONE_AGENT_PHASES
+
+
+@pytest.mark.parametrize(
+    "argv", [[], ["--all"], ["some-run"], ["--all", "--pretty"]]
+)
+def test_journal_check_with_any_arguments_is_no_such_command(tmp_path, monkeypatch, argv):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = runner.invoke(cli.app, ["journal-check", *argv])
+
+    assert result.exit_code == 2, result.output
+    assert "No such command 'journal-check'" in result.output
+    assert '"ok"' not in result.output
+    assert not paths.db_path().exists()
+    assert not (paths.data_path() / "runs").exists()
+
+
+def test_journal_check_is_no_longer_a_command():
+    assert "journal-check" not in [c.name for c in cli.app.registered_commands]
+    assert importlib.util.find_spec("agent_manager.journal_check") is None
+
+
+def test_help_lists_no_journal_check():
+    result = runner.invoke(cli.app, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "journal-check" not in result.output

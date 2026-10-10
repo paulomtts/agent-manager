@@ -3,7 +3,7 @@
 Single-store design D:381-385. Every `am` is a real child process under the
 fake `claude`. A foreign process holding `am.db`'s write lock past the retry
 budget ends a live `am run` with the `StoreBusyError` envelope at exit 3, and
-mirrors nothing it did not commit. Two `am` processes writing different runs
+records nothing it did not commit. Two `am` processes writing different runs
 at once lose no event, and each run's events stay in order. The foreign holder
 is `storehelpers.hold_db`; order comes from marker files, pipe lines and
 exits, never from sleeping.
@@ -62,12 +62,6 @@ def _data(code: int, envelope: dict) -> dict:
     return envelope["data"]
 
 
-def _clean_runs(am, *target: str) -> dict[str, bool]:
-    """`am journal-check *target`: each reported run's `clean`."""
-    report = _data(*am("journal-check", *target))
-    return {run["run_id"]: run["clean"] for run in report["runs"]}
-
-
 @pytest.mark.e2e_fake
 def test_am_run_blocked_past_the_retry_budget_is_a_store_busy_envelope_at_exit_3(
     milestone_board, fake_claude_bin, hold, spawn_am, finish_am, am, wait_for_file
@@ -103,7 +97,14 @@ def test_am_run_blocked_past_the_retry_budget_is_a_store_busy_envelope_at_exit_3
     assert held_head == head
     runs = _data(*am("runs", "--repo-dir", str(root)))["runs"]
     (run_id,) = [row["id"] for row in runs]
-    assert _clean_runs(am, run_id) == {run_id: True}
+    st = store_writer.Store.open(root, run_id)
+    try:
+        lines = store_events.run_lines(st.read_connection, run_id)
+        loaded = st.load_run(run_id)
+    finally:
+        st.close()
+    assert loaded is not None, run_id
+    assert store_replay.diverging(lines, loaded) == [], run_id
 
 
 def _events_by_run(run_ids: list[str]) -> dict[str, list[store_events.EventRow]]:
@@ -117,7 +118,7 @@ def _events_by_run(run_ids: list[str]) -> dict[str, list[store_events.EventRow]]
 
 @pytest.mark.e2e_fake
 def test_two_am_processes_on_different_runs_keep_every_event_in_order(
-    two_milestone_board, fake_claude_bin, rendezvous, spawn_am, finish_am, am
+    two_milestone_board, fake_claude_bin, rendezvous, spawn_am, finish_am
 ):
     """D:385. Each milestone drives one story at a time, so the count-2
     rendezvous can only be met while both processes are live: their writes
@@ -155,8 +156,6 @@ def test_two_am_processes_on_different_runs_keep_every_event_in_order(
     assert set(first).isdisjoint(second)
     # Non-vacuity: each run committed events both before and after the other's.
     assert min(first) < max(second) and min(second) < max(first)
-    clean = _clean_runs(am, "--all")
-    assert {run_id: clean.get(run_id) for run_id in run_ids} == dict.fromkeys(run_ids, True)
     for run_id in run_ids:
         st = store_writer.Store.open(root, run_id)
         try:

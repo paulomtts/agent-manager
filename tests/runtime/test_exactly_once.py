@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import eventlines
 from pydantic import BaseModel, ConfigDict
 from pygents import AgentRegistry, ToolRegistry
 
@@ -316,7 +317,7 @@ def _phase_rows(opened, phase: str) -> list[str]:
     """Every `phase_upsert` status of `phase` in `opened`'s own journal, in order."""
     return [
         line.payload["status"]
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert" and line.phase == phase
     ]
 
@@ -831,7 +832,7 @@ def test_a_relaunch_whose_source_journal_file_is_gone_still_adopts_from_its_even
     with pytest.raises(_Crash):
         _go(_workflow([]), store, _runner(store, launcher, roles))
     crashed = store.latest_checkpoint(CARD_ID)
-    store.journal.path.unlink()
+    assert not eventlines.journal_file(store.run_id).exists()
 
     _new_process()
     other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)

@@ -34,6 +34,7 @@ from agent_manager.store import db as store_db
 from agent_manager.store import events as store_events
 from agent_manager.store import journal as store_journal
 from agent_manager.store import queries as store_queries
+from agent_manager.store import writer as store_writer
 
 HOST = "here"
 
@@ -788,3 +789,31 @@ def test_an_unreadable_journal_refuses_as_unreadable(repos):
     assert error.run_ids == ("run-a",)
     assert str(path) in str(error)
     assert not paths.db_path().exists()
+
+
+def test_an_imported_run_records_on_without_touching_its_journal(repos):
+    # 3.1.1 B2: the imported file is history; new events go to `am.db` only,
+    # numbered after the imported ones.
+    alpha, _ = repos
+    write_db(project_file(alpha), full_rows("run-a", alpha))
+    path = write_journal(
+        "run-a", [journal_line("run-a", 1, _ts(1)), journal_line("run-a", 2, _ts(2))]
+    )
+    before = path.read_bytes()
+    _run()
+
+    st = store_writer.Store.open(alpha, "run-a")
+    try:
+        line = st.record_story(
+            models.StoryRun(card_id="s2", title="t", level=0, status="started")
+        )
+    finally:
+        st.close()
+
+    assert [(row["run_seq"], row["source"]) for row in _events()] == [
+        (1, "imported"),
+        (2, "imported"),
+        (3, "live"),
+    ]
+    assert line.seq == 3
+    assert path.read_bytes() == before

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import eventlines
 
 from agent_manager import models, paths
 from agent_manager.store import db as store_db
@@ -87,7 +88,7 @@ def _subtask() -> models.SubtaskRun:
 def _phase_rows(opened) -> list[tuple[str | None, str, str | None]]:
     return [
         (line.phase, line.payload["status"], line.payload["detail"])
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert"
     ]
 

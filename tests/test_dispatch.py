@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import eventlines
 from pydantic import BaseModel, ConfigDict
 
 from agent_manager import (
@@ -596,7 +597,7 @@ def _context(worktree: Path) -> dict[str, object]:
 def _attempt_statuses(opened) -> list[tuple[int | None, str]]:
     return [
         (line.attempt, line.payload["status"])
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "attempt_upsert"
     ]
 
@@ -604,7 +605,7 @@ def _attempt_statuses(opened) -> list[tuple[int | None, str]]:
 def _phase_statuses(opened) -> list[tuple[str | None, str]]:
     return [
         (line.phase, line.payload["status"])
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert"
     ]
 
@@ -651,7 +652,7 @@ def _terminal_attempts(opened) -> list[dict]:
     """Every journalled attempt payload past `started`, in journal order."""
     return [
         line.payload
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "attempt_upsert" and line.payload["status"] != "started"
     ]
 
@@ -826,7 +827,7 @@ def test_two_harness_errors_fail_the_phase_as_today(store, tmp_path, worktree):
     assert _phase_statuses(store) == [("explore", "started"), ("explore", "failed")]
     failed_detail = [
         line.payload["detail"]
-        for line in store.journal.read()
+        for line in eventlines.run_lines(store.run_id)
         if line.event == "phase_upsert"
     ][-1]
     assert failed_detail == caught.value.detail
@@ -1090,7 +1091,7 @@ def _journalled_timeouts(opened) -> list[tuple[str | None, int | None, str, floa
     """`(phase, attempt, status, dispatch.timeout)` of every journalled attempt."""
     return [
         (line.phase, line.attempt, line.payload["status"], line.payload["dispatch"]["timeout"])
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "attempt_upsert"
     ]
 
@@ -1451,7 +1452,7 @@ class _ControlSignal(BaseException):
 def _last_phase_detail(opened) -> str | None:
     return [
         line.payload["detail"]
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert"
     ][-1]
 
@@ -1709,7 +1710,7 @@ def test_a_phase_with_no_result_model_declared_needs_no_table_entry(
     # used (cli.read_artifact reads it) even though classify was handed None.
     terminal = [
         line.payload
-        for line in store.journal.read()
+        for line in eventlines.run_lines(store.run_id)
         if line.event == "attempt_upsert" and line.payload["status"] == "ok"
     ][0]
     assert terminal["result_path"].endswith("spec.1/result.json")
@@ -1892,7 +1893,7 @@ def test_an_unexpected_error_mid_attempt_still_closes_the_phase(store, tmp_path,
     assert _phase_statuses(store) == [("explore", "started"), ("explore", "failed")]
     detail = [
         line.payload["detail"]
-        for line in store.journal.read()
+        for line in eventlines.run_lines(store.run_id)
         if line.event == "phase_upsert"
     ][-1]
     assert "OSError: the run directory went away" in detail
@@ -2062,7 +2063,7 @@ def test_the_journalled_prompt_path_is_the_file_the_launcher_was_pointed_at(
     pointed = Path(argv[argv.index("--prompt") + 1])
     terminal = [
         line.payload
-        for line in store.journal.read()
+        for line in eventlines.run_lines(store.run_id)
         if line.event == "attempt_upsert" and line.payload["status"] == "ok"
     ][0]
     on_disk = pointed.read_text(encoding="utf-8")
@@ -2514,11 +2515,11 @@ def test_adopted_is_a_frozen_plain_value():
 
 def test_an_attempt_at_or_below_the_floor_is_not_adopted(store, tmp_path, worktree):
     runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
-    lines = len(store.journal.read())
+    lines = len(eventlines.run_lines(store.run_id))
 
     assert runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=1) is None
     assert runner.warnings == []
-    assert len(store.journal.read()) == lines
+    assert len(eventlines.run_lines(store.run_id)) == lines
     assert len(launcher.calls) == 1
 
 
@@ -2536,7 +2537,7 @@ def test_an_orphaned_attempt_is_never_adopted(store, tmp_path, worktree):
 
     # Resume later marks the orphan `harness_error`; it is still never adopted.
     started = next(
-        line.payload for line in store.journal.read() if line.event == "attempt_upsert"
+        line.payload for line in eventlines.run_lines(store.run_id) if line.event == "attempt_upsert"
     )
     store.record_attempt(
         STORY_ID,
@@ -2567,7 +2568,7 @@ def test_a_result_that_no_longer_validates_is_declined(
         result_file.write_text(NOT_JSON, encoding="utf-8")
     else:
         result_file.write_text(INVALID_RESULT, encoding="utf-8")
-    lines = len(store.journal.read())
+    lines = len(eventlines.run_lines(store.run_id))
 
     assert runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=0) is None
 
@@ -2575,13 +2576,13 @@ def test_a_result_that_no_longer_validates_is_declined(
     assert warning.startswith(f"phase 'explore': attempt 1 of run {RUN_ID} was not reused (")
     assert warning.endswith("); dispatching again")
     assert why in warning
-    assert len(store.journal.read()) == lines
+    assert len(eventlines.run_lines(store.run_id)) == lines
     assert len(launcher.calls) == 1
 
 
 def test_a_gate_that_fails_now_declines(store, tmp_path, worktree):
     runner, _, _ = _succeed_once(store, tmp_path, worktree)
-    lines = len(store.journal.read())
+    lines = len(eventlines.run_lines(store.run_id))
 
     failing = _model_phase(lambda result: {"blocked": True})
     assert runner.adopt(failing, _context(worktree), source_run=RUN_ID, floor=0) is None
@@ -2589,7 +2590,7 @@ def test_a_gate_that_fails_now_declines(store, tmp_path, worktree):
     [warning] = _declines(runner)
     assert warning.startswith(f"phase 'explore': attempt 1 of run {RUN_ID} was not reused (")
     assert "gate '<lambda>' failed: blocked=True" in warning
-    assert len(store.journal.read()) == lines
+    assert len(eventlines.run_lines(store.run_id)) == lines
 
 
 def test_a_gate_that_raises_now_declines_rather_than_raising(store, tmp_path, worktree):
@@ -2669,7 +2670,7 @@ def test_a_phase_or_card_the_source_run_never_recorded_adopts_nothing_silently(
 ):
     # Review Focus 2, the other half: nothing to adopt is not a decline.
     runner, _, phase = _succeed_once(store, tmp_path, worktree)
-    lines = len(store.journal.read())
+    lines = len(eventlines.run_lines(store.run_id))
 
     never_ran = _model_phase(lambda result: None, name="review")
     assert runner.adopt(never_ran, _context(worktree), source_run=RUN_ID, floor=0) is None
@@ -2681,7 +2682,7 @@ def test_a_phase_or_card_the_source_run_never_recorded_adopts_nothing_silently(
 
     assert runner.warnings == []
     assert stranger.warnings == []
-    assert len(store.journal.read()) == lines
+    assert len(eventlines.run_lines(store.run_id)) == lines
 
 
 def test_the_highest_ok_attempt_above_the_floor_is_adopted(store, tmp_path, worktree):
@@ -2706,7 +2707,7 @@ def test_the_highest_ok_attempt_above_the_floor_is_adopted(store, tmp_path, work
 def test_a_source_run_with_no_events_declines(store, tmp_path, worktree):
     # Spec test 13.
     runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
-    lines = len(store.journal.read())
+    lines = len(eventlines.run_lines(store.run_id))
 
     assert runner.adopt(phase, _context(worktree), source_run="never-ran", floor=0) is None
 
@@ -2717,7 +2718,7 @@ def test_a_source_run_with_no_events_declines(store, tmp_path, worktree):
     )
     assert "no events" in warning
     assert warning.endswith("); dispatching again")
-    assert len(store.journal.read()) == lines
+    assert len(eventlines.run_lines(store.run_id)) == lines
     assert len(launcher.calls) == 1
     # Review Focus 5: declining leaves no run directory for a run that never was.
     assert not (paths.data_dir() / "runs" / "never-ran").exists()
@@ -2740,7 +2741,7 @@ def test_a_phase_without_a_result_model_adopts_none(store, tmp_path, worktree):
 def test_a_source_event_that_fails_validation_declines(store, tmp_path, worktree):
     # Spec test 14.
     runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
-    lines = len(store.journal.read())
+    lines = len(eventlines.run_lines(store.run_id))
     # Valid JSON, but no `models.Run`: replay raises pydantic's
     # ValidationError, which is a decline, never an exception out of resume.
     _plant_event(tmp_path / "repo", OTHER_RUN_ID, "run_upsert", {"not": "a run"})
@@ -2752,7 +2753,7 @@ def test_a_source_event_that_fails_validation_declines(store, tmp_path, worktree
         f"phase 'explore': attempt ? of run {OTHER_RUN_ID} was not reused ("
         "its events cannot be read: ValidationError"
     )
-    assert len(store.journal.read()) == lines
+    assert len(eventlines.run_lines(store.run_id)) == lines
     assert len(launcher.calls) == 1
 
 
@@ -2819,7 +2820,7 @@ def test_an_adopted_phase_keeps_the_recorded_start(store, tmp_path, worktree):
         )
         runner.adopt(_passing_phase(), _context(worktree), source_run=RUN_ID, floor=0)
         [payload] = [
-            line.payload for line in other.journal.read() if line.event == "phase_upsert"
+            line.payload for line in eventlines.run_lines(other.run_id) if line.event == "phase_upsert"
         ]
     finally:
         other.close()
@@ -2907,7 +2908,7 @@ def _limit_runner(store, script, tmp_path, worktree, **overrides):
 def _phase_details(opened) -> list[str | None]:
     return [
         line.payload.get("detail")
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert"
     ]
 

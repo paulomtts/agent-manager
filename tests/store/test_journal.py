@@ -1,16 +1,14 @@
-"""Behaviour of `agent_manager.store.journal`: a run's append-only JSONL journal,
-its line envelope and event kinds, appending and reading it.
+"""Behaviour of `agent_manager.store.journal`: a run's JSONL journal, its line
+envelope and event kinds, reading a journal file and reading it verbatim.
 
-Real JSONL files under `tmp_path`, and threads in one process; nothing spawns a
-process, so these are unit tests. The `repo` fixture redirects `XDG_DATA_HOME`
-and `HOME`.
+Real JSONL files under `tmp_path`; nothing spawns a process, so these are unit
+tests. The `repo` fixture redirects `XDG_DATA_HOME` and `HOME`.
 """
 
 import ast
 import json
 import re
 import sys
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import get_args
@@ -105,9 +103,8 @@ def test_a_journal_line_of_a_lease_or_control_kind_validates_and_is_no_node_kind
 
 def test_the_store_package_does_not_re_export_journal_names():
     assert [name for name in _JOURNAL_NAMES if hasattr(store, name)] == []
-    # `append` fsyncs through `store_journal.os`. Were `os` still bound on the
-    # package, a test patching `store.os.fsync` would patch the shared module
-    # and pass while naming the wrong one.
+    # Were `os` bound on the package, a test patching `store.os` would patch
+    # the shared module and pass while naming the wrong one.
     assert not hasattr(store, "os")
 
 
@@ -180,7 +177,7 @@ def test_no_source_module_reads_a_private_journal_name():
     # with their readers; moving them here would make `store.replay` read a
     # private name off this module.
     assert _PRIVATE_JOURNAL_NAME.search("store_journal._EVENT_KINDS")
-    assert not _PRIVATE_JOURNAL_NAME.search("store_journal.Journal._for_reading(run_id)")
+    assert not _PRIVATE_JOURNAL_NAME.search("store_journal.Journal(run_id).read()")
     hits = [
         f"{path.relative_to(_REPO)}:{number}: {line.strip()}"
         for path in sorted((_REPO / "src").rglob("*.py"))
@@ -191,152 +188,51 @@ def test_no_source_module_reads_a_private_journal_name():
     assert hits == []
 
 
-def _append_raw(journal: store_journal.Journal, record: dict) -> None:
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record) + "\n")
+LINE_TS = "2026-09-23T10:00:00+00:00"
 
 
-def test_append_writes_one_json_line_with_every_coordinate(repo):
-    journal = store_journal.Journal(RUN_ID)
-    line = journal.append(
-        "attempt_upsert",
-        {"n": 1, "status": "started"},
-        story="8831189b",
-        card="ef248597",
-        phase="implement",
-        attempt=1,
+def _run_line(seq: int, i: object) -> dict:
+    """A known `run_upsert` line of `RUN_ID` whose payload is `{"i": i}`."""
+    return journal_line(RUN_ID, seq, LINE_TS, payload={"i": i})
+
+
+def _journal_file(
+    *records: dict, tail: str = "", run_id: str = RUN_ID
+) -> store_journal.Journal:
+    """The reader of `run_id`'s journal file, written first as `write_journal`
+    writes it: one JSON line per record, then `tail` verbatim."""
+    write_journal(run_id, records, tail=tail or None)
+    return store_journal.Journal(run_id)
+
+
+def test_constructing_a_journal_creates_and_reads_nothing(repo, tmp_path):
+    journal = store_journal.Journal("never-ran")
+
+    assert journal.run_id == "never-ran"
+    assert journal.path == (
+        paths.data_path() / "runs" / "never-ran" / store_journal.JOURNAL_NAME
     )
+    assert not (tmp_path / "data").exists()
 
-    assert journal.path == paths.run_dir(RUN_ID) / "journal.jsonl"
-    text = journal.path.read_text(encoding="utf-8")
-    assert text.endswith("\n")
-    assert len(text.splitlines()) == 1
-
-    record = json.loads(text)
-    assert record["seq"] == 1
-    assert record["run_id"] == RUN_ID
-    assert record["event"] == "attempt_upsert"
-    assert record["story"] == "8831189b"
-    assert record["card"] == "ef248597"
-    assert record["phase"] == "implement"
-    assert record["attempt"] == 1
-    assert record["payload"] == {"n": 1, "status": "started"}
-    assert line.seq == 1
-
-
-def test_run_level_lines_leave_the_lower_coordinates_null(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"status": "started"})
-
-    record = json.loads(journal.path.read_text(encoding="utf-8"))
-    assert record["story"] is None
-    assert record["card"] is None
-    assert record["phase"] is None
-    assert record["attempt"] is None
-
-
-def test_sequence_numbers_increase_by_one(repo):
-    journal = store_journal.Journal(RUN_ID)
-    seqs = [journal.append("run_upsert", {"i": i}).seq for i in range(3)]
-    assert seqs == [1, 2, 3]
-    assert [line.seq for line in journal.read()] == [1, 2, 3]
-
-
-def test_a_reopened_journal_continues_the_sequence(repo):
-    first = store_journal.Journal(RUN_ID)
-    first.append("run_upsert", {"i": 0})
-    first.append("run_upsert", {"i": 1})
-
-    second = store_journal.Journal(RUN_ID)
-    assert second.last_seq() == 2
-    assert second.append("run_upsert", {"i": 2}).seq == 3
-    assert [line.payload["i"] for line in second.read()] == [0, 1, 2]
-
-
-def test_appending_reads_nothing_from_disk_once_the_journal_is_open(repo, monkeypatch):
-    # P2: one process writes a run, so the counter is read once, at open, and
-    # appending never re-reads the file. Counted, not timed (P7).
-    calls = {"read": 0, "last_seq": 0}
-    real_read = store_journal.Journal.read
-    real_last_seq = store_journal.Journal.last_seq
-
-    def counting_read(self):
-        calls["read"] += 1
-        return real_read(self)
-
-    def counting_last_seq(self):
-        calls["last_seq"] += 1
-        return real_last_seq(self)
-
-    monkeypatch.setattr(store_journal.Journal, "read", counting_read)
-    monkeypatch.setattr(store_journal.Journal, "last_seq", counting_last_seq)
-
-    journal = store_journal.Journal(RUN_ID)
-    calls["read"] = 0
-    calls["last_seq"] = 0
-
-    seqs = [journal.append("run_upsert", {"i": i}).seq for i in range(50)]
-
-    assert calls == {"read": 0, "last_seq": 0}
-    assert seqs == list(range(1, 51))
-
-
-def test_a_fresh_journal_on_an_existing_run_continues_after_the_last_line(repo):
-    first = store_journal.Journal(RUN_ID)
-    for i in range(3):
-        first.append("run_upsert", {"i": i})
-
-    resumed = store_journal.Journal(RUN_ID)
-    assert resumed.append("run_upsert", {"i": 3}).seq == 4
-    assert resumed.append("run_upsert", {"i": 4}).seq == 5
-    assert [line.seq for line in resumed.read()] == [1, 2, 3, 4, 5]
-
-
-def test_a_journal_of_only_blank_lines_opens_at_zero(repo):
-    # Review Focus 1: a crash between write and flush can leave blank lines
-    # and nothing else. That is an empty journal, not a corrupt one.
-    first = store_journal.Journal(RUN_ID)
-    first.path.write_text("\n\n", encoding="utf-8")
-
-    journal = store_journal.Journal(RUN_ID)
-    assert journal.append("run_upsert", {"i": 0}).seq == 1
-
-
-def test_a_journal_opened_on_out_of_order_lines_continues_after_the_highest(repo):
-    # Review Focus 2: the counter is the highest seq on disk, not the seq of
-    # the last line in file order.
-    first = store_journal.Journal(RUN_ID)
-    first.append("run_upsert", {"i": 1})
-    for seq in (3, 2):
-        _append_raw(
-            first,
-            {
-                "seq": seq,
-                "ts": "2026-09-23T10:00:00+00:00",
-                "run_id": RUN_ID,
-                "event": "run_upsert",
-                "payload": {"i": seq},
-            },
-        )
-
-    journal = store_journal.Journal(RUN_ID)
-    assert journal.append("run_upsert", {"i": 4}).seq == 4
-    assert [line.seq for line in journal.read()] == [1, 2, 3, 4]
-
-
-def test_opening_a_corrupt_journal_raises_at_open(repo):
-    # The counter is read at open, so a corrupt journal is reported there
-    # rather than at the first append.
-    first = store_journal.Journal(RUN_ID)
-    first.append("run_upsert", {"i": 0})
-    with first.path.open("a", encoding="utf-8") as handle:
-        handle.write("this is not json\n")
-
+    corrupt = _journal_file(_run_line(1, 0), tail="this is not json\n")
     with pytest.raises(store_journal.CorruptJournalError) as excinfo:
-        store_journal.Journal(RUN_ID)
-    message = str(excinfo.value)
-    assert str(first.path) in message
-    assert ":2:" in message
+        corrupt.read()
+    assert f"{corrupt.path}:2:" in str(excinfo.value)
+
+
+def test_a_journal_of_only_blank_lines_reads_as_empty(repo):
+    # A crash between write and flush could leave blank lines and nothing
+    # else. That is an empty journal, not a corrupt one.
+    assert _journal_file(tail="\n\n").read() == []
+
+
+def test_read_returns_lines_in_seq_order_not_file_order(repo):
+    journal = _journal_file(_run_line(1, 1), _run_line(3, 3), _run_line(2, 2))
+
+    lines = journal.read()
+
+    assert [line.seq for line in lines] == [1, 2, 3]
+    assert [line.payload["i"] for line in lines] == [1, 2, 3]
 
 
 def test_reading_a_journal_that_does_not_exist_raises(repo):
@@ -347,122 +243,8 @@ def test_reading_a_journal_that_does_not_exist_raises(repo):
     assert str(journal.path) in str(excinfo.value)
 
 
-def test_append_holds_the_lock_across_the_write_and_the_fsync(repo, monkeypatch):
-    # Deterministic (P7): rather than racing threads and hoping to catch an
-    # overlap, check the lock is held at the moment the line is fsynced.
-    journal = store_journal.Journal(RUN_ID)
-    held_during_fsync: list[bool] = []
-    real_fsync = store_journal.os.fsync
-
-    def spying_fsync(fd):
-        held_during_fsync.append(journal._lock.locked())
-        real_fsync(fd)
-
-    monkeypatch.setattr(store_journal.os, "fsync", spying_fsync)
-
-    journal.append("run_upsert", {"i": 0})
-    journal.append("run_upsert", {"i": 1})
-
-    assert held_during_fsync == [True, True]
-    assert journal._lock.locked() is False
-
-
-def test_eight_threads_sharing_one_journal_write_800_whole_lines_numbered_1_to_800(repo):
-    workers, per_worker = 8, 100
-    journal = store_journal.Journal(RUN_ID)
-    start = threading.Barrier(workers)
-    errors: list[BaseException] = []
-
-    def work(worker: int) -> None:
-        try:
-            start.wait()
-            for i in range(per_worker):
-                journal.append("run_upsert", {"w": worker, "i": i})
-        except BaseException as error:  # surfaced by the assertion below
-            errors.append(error)
-
-    threads = [threading.Thread(target=work, args=(w,)) for w in range(workers)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert errors == []
-    raw = [
-        text
-        for text in journal.path.read_text(encoding="utf-8").splitlines()
-        if text.strip()
-    ]
-    assert len(raw) == workers * per_worker
-    records = [json.loads(text) for text in raw]  # a torn line fails here
-    assert sorted(record["seq"] for record in records) == list(
-        range(1, workers * per_worker + 1)
-    )
-    for worker in range(workers):
-        own = [record for record in records if record["payload"]["w"] == worker]
-        assert [record["payload"]["i"] for record in sorted(own, key=lambda r: r["seq"])] == list(
-            range(per_worker)
-        )
-
-
-def test_a_failed_write_releases_the_lock_and_does_not_spend_a_number(repo, tmp_path):
-    # Review Focus 3: the path cannot be opened for appending, so nothing
-    # lands on disk. The lock is released and the next append reuses the number.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-
-    real_path = journal.path
-    directory = tmp_path / "a-directory-not-a-file"
-    directory.mkdir()
-    journal.path = directory
-    with pytest.raises(OSError):
-        journal.append("run_upsert", {"i": "lost"})
-    assert journal._lock.locked() is False
-
-    journal.path = real_path
-    assert journal.append("run_upsert", {"i": 1}).seq == 2
-    assert [line.seq for line in journal.read()] == [1, 2]
-
-
-def test_a_failed_fsync_after_the_write_spends_the_number_so_no_seq_repeats(repo, monkeypatch):
-    # Once write and flush succeed the line is in the file, fsynced or not, so
-    # retrying its number would put a duplicate seq on disk.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-
-    real_fsync = store_journal.os.fsync
-
-    def failing_fsync(fd):
-        raise OSError("fsync failed")
-
-    monkeypatch.setattr(store_journal.os, "fsync", failing_fsync)
-    with pytest.raises(OSError, match="fsync failed"):
-        journal.append("run_upsert", {"i": "unsynced"})
-    assert journal._lock.locked() is False
-
-    monkeypatch.setattr(store_journal.os, "fsync", real_fsync)
-    assert journal.append("run_upsert", {"i": 2}).seq == 3
-    assert [line.seq for line in journal.read()] == [1, 2, 3]
-
-
-def test_an_invalid_line_releases_the_lock_and_does_not_spend_a_number(repo):
-    # Review Focus 4: JournalLine validation runs inside the lock.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-
-    with pytest.raises(ValidationError):
-        journal.append("not_an_event", {})  # type: ignore[arg-type]
-    assert journal._lock.locked() is False
-
-    assert journal.append("run_upsert", {"i": 1}).seq == 2
-    assert [line.seq for line in journal.read()] == [1, 2]
-
-
 def test_a_non_json_line_names_the_file_and_the_line_number(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write("this is not json\n")
+    journal = _journal_file(_run_line(1, 0), tail="this is not json\n")
 
     with pytest.raises(store_journal.CorruptJournalError) as excinfo:
         journal.read()
@@ -472,60 +254,26 @@ def test_a_non_json_line_names_the_file_and_the_line_number(repo):
 
 
 def test_a_truncated_final_line_is_an_error_but_a_blank_one_is_not(repo):
-    # Review Focus 2: a crash mid-append leaves either nothing, a blank line, or
-    # half a line. The blank one is noise; the half line is data loss and says so.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write("\n")
-    assert [line.payload["i"] for line in journal.read()] == [0]
+    # A crash mid-append leaves either nothing, a blank line, or half a line.
+    # The blank one is noise; the half line is data loss and says so.
+    assert [line.payload["i"] for line in _journal_file(_run_line(1, 0), tail="\n").read()] == [0]
 
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write('{"seq": 2, "run_id": "run-2026\n')
+    journal = _journal_file(_run_line(1, 0), tail='\n{"seq": 2, "run_id": "run-2026\n')
     with pytest.raises(store_journal.CorruptJournalError) as excinfo:
         journal.read()
     assert ":3:" in str(excinfo.value)
 
 
 def test_an_envelope_with_an_unknown_key_is_rejected(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "seq": 2,
-                    "ts": "2026-09-23T10:00:00+00:00",
-                    "run_id": RUN_ID,
-                    "event": "run_upsert",
-                    "payload": {},
-                    "operator": "someone",
-                }
-            )
-            + "\n"
-        )
+    journal = _journal_file(_run_line(1, 0), {**_run_line(2, 1), "operator": "someone"})
 
     with pytest.raises(ValidationError) as excinfo:
         journal.read()
     assert "operator" in str(excinfo.value)
 
 
-def test_a_run_directory_that_cannot_be_created_propagates_the_os_error(repo, tmp_path):
-    # The journal defers directory creation to `paths.run_dir`, so the OS error
-    # comes through untouched -- the store adds no fallback of its own.
-    runs = tmp_path / "data" / "agent-manager" / "runs"
-    runs.mkdir(parents=True)
-    (runs / "run-blocked").write_text("not a directory")
-
-    with pytest.raises(OSError):
-        store_journal.Journal("run-blocked")
-
-
 def test_ignore_torn_tail_skips_only_an_unterminated_last_line(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write('{"seq": 2, "run_id"')
+    journal = _journal_file(_run_line(1, 0), tail='{"seq": 2, "run_id"')
 
     with pytest.raises(store_journal.CorruptJournalError):
         journal.read()
@@ -533,11 +281,7 @@ def test_ignore_torn_tail_skips_only_an_unterminated_last_line(repo):
 
 
 def test_ignore_torn_tail_still_rejects_a_bad_line_before_the_last(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write("this is not json\n")
-        handle.write('{"seq": 3')
+    journal = _journal_file(_run_line(1, 0), tail='this is not json\n{"seq": 3')
 
     with pytest.raises(store_journal.CorruptJournalError) as excinfo:
         journal.read(ignore_torn_tail=True)
@@ -552,7 +296,7 @@ def test_ignore_torn_tail_still_raises_for_a_missing_journal(repo):
 
 def test_reading_a_journal_that_does_not_exist_creates_no_data_dir(repo, tmp_path):
     with pytest.raises(store_journal.MissingJournalError):
-        store_journal.Journal._for_reading("run-that-never-was").read()
+        store_journal.Journal("run-that-never-was").read()
 
     assert not (tmp_path / "data").exists()
 
@@ -561,7 +305,7 @@ def test_reading_a_journal_that_does_not_exist_creates_no_data_dir(repo, tmp_pat
 #
 # Default suite, unmarked: real temp JSONL/SQLite files, no git, brd or
 # subprocess. A newer `am` may journal an event kind this version's `EventKind`
-# does not list; reading skips that line, writing stays strict.
+# does not list; reading skips that line.
 
 UNRECOGNISED_EVENT = "future_upsert"
 
@@ -581,19 +325,7 @@ def _unrecognised_line(seq: int, run_id: str = RUN_ID, **extra: object) -> dict:
 
 
 def test_read_skips_a_line_whose_event_it_does_not_recognise(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    _append_raw(journal, _unrecognised_line(2))
-    _append_raw(
-        journal,
-        {
-            "seq": 3,
-            "ts": "2026-10-02T10:01:00+00:00",
-            "run_id": RUN_ID,
-            "event": "run_upsert",
-            "payload": {"i": 2},
-        },
-    )
+    journal = _journal_file(_run_line(1, 0), _unrecognised_line(2), _run_line(3, 2))
 
     lines = journal.read()
 
@@ -603,10 +335,8 @@ def test_read_skips_a_line_whose_event_it_does_not_recognise(repo):
 
 
 def test_an_unrecognised_event_is_skipped_whatever_else_the_line_holds(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    _append_raw(
-        journal,
+    journal = _journal_file(
+        _run_line(1, 0),
         _unrecognised_line(
             2,
             operator="someone",
@@ -621,22 +351,17 @@ def test_an_unrecognised_event_is_skipped_whatever_else_the_line_holds(repo):
 
 
 def test_an_unrecognised_event_without_a_valid_seq_still_raises(repo):
-    # Review Focus 1: `last_seq` must recover a skipped line's seq, so a line
-    # with no usable seq is not tolerated just because its event is unknown.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
+    # A skipped line must still carry a positive `seq`: a line with no usable
+    # seq is not tolerated just because its event is unknown.
     without_seq = _unrecognised_line(2)
     del without_seq["seq"]
-    _append_raw(journal, without_seq)
 
     with pytest.raises(ValidationError) as excinfo:
-        journal.read()
+        _journal_file(_run_line(1, 0), without_seq).read()
     assert "seq" in str(excinfo.value)
 
-    journal.path.write_text("", encoding="utf-8")
-    _append_raw(journal, _unrecognised_line(0))
     with pytest.raises(ValidationError) as excinfo:
-        journal.read()
+        _journal_file(_unrecognised_line(0)).read()
     assert "seq" in str(excinfo.value)
 
 
@@ -652,42 +377,26 @@ def test_an_unrecognised_event_without_a_valid_seq_still_raises(repo):
     ids=["no-event", "null-event", "int-event", "array", "json-null"],
 )
 def test_a_line_without_a_string_event_or_not_an_object_still_raises(repo, raw):
-    # Review Focus 2: only a *string* event outside EventKind is skipped.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write(raw + "\n")
+    # Only a *string* event outside EventKind is skipped.
+    journal = _journal_file(_run_line(1, 0), tail=raw + "\n")
 
     with pytest.raises(ValidationError):
         journal.read()
 
 
 def test_read_passes_unknown_payload_keys_on_a_known_event_through(repo):
-    # Review Focus 4: §3.4's "ignore unknown payload keys" holds at the read
-    # layer because `payload` is an untyped dict; `replay()` still judges it.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    _append_raw(
-        journal,
-        {
-            "seq": 2,
-            "ts": "2026-10-02T10:00:00+00:00",
-            "run_id": RUN_ID,
-            "event": "run_upsert",
-            "payload": {"i": 1, "future_key": {"deep": True}},
-        },
+    # §3.4's "ignore unknown payload keys" holds at the read layer because
+    # `payload` is an untyped dict; `replay()` still judges it.
+    journal = _journal_file(
+        _run_line(1, 0),
+        {**_run_line(2, 1), "payload": {"i": 1, "future_key": {"deep": True}}},
     )
 
     assert journal.read()[1].payload == {"i": 1, "future_key": {"deep": True}}
 
 
 def test_ignore_torn_tail_and_an_unrecognised_event_are_both_skipped(repo):
-    # Review Focus 3.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    _append_raw(journal, _unrecognised_line(2))
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write('{"seq": 3, "run_id"')
+    journal = _journal_file(_run_line(1, 0), _unrecognised_line(2), tail='{"seq": 3, "run_id"')
 
     assert [line.payload["i"] for line in journal.read(ignore_torn_tail=True)] == [0]
     with pytest.raises(store_journal.CorruptJournalError) as excinfo:
@@ -695,71 +404,7 @@ def test_ignore_torn_tail_and_an_unrecognised_event_are_both_skipped(repo):
     assert ":3:" in str(excinfo.value)
 
 
-def test_append_still_refuses_an_unrecognised_event(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    _append_raw(journal, _unrecognised_line(2))
-    before = journal.path.read_bytes()
-
-    with pytest.raises(ValidationError):
-        journal.append(UNRECOGNISED_EVENT, {})  # type: ignore[arg-type]
-
-    assert journal.path.read_bytes() == before
-    assert journal._lock.locked() is False
-
-
-def test_a_skipped_line_still_counts_toward_last_seq(repo):
-    # `append` promises no seq is ever repeated on disk: an older `am` resuming
-    # a newer `am`'s run must number its next line above the skipped one.
-    first = store_journal.Journal(RUN_ID)
-    first.append("run_upsert", {"i": 0})
-    _append_raw(first, _unrecognised_line(2))
-
-    reopened = store_journal.Journal(RUN_ID)
-    assert reopened.last_seq() == 2
-    assert reopened.append("run_upsert", {"i": 1}).seq == 3
-
-    again = store_journal.Journal(RUN_ID)
-    assert again.last_seq() == 3
-    assert [line.seq for line in again.read()] == [1, 3]
-
-
-def test_read_holds_the_append_lock_across_the_scan(repo, monkeypatch):
-    # Deterministic: check the lock is held at the moment the file is scanned,
-    # so an append on another thread can never be met half-written.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    held_during_scan: list[bool] = []
-    real_scan = journal._scan
-
-    def spying_scan(**kwargs):
-        held_during_scan.append(journal._lock.locked())
-        return real_scan(**kwargs)
-
-    monkeypatch.setattr(journal, "_scan", spying_scan)
-
-    lines = journal.read()
-
-    assert held_during_scan == [True]
-    assert journal._lock.locked() is False
-    assert [line.seq for line in lines] == [1]
-
-
-# -- mirror: a line numbered elsewhere, written verbatim ------------------------
-
-
-def _mirrored_line(seq: int) -> store_journal.JournalLine:
-    return store_journal.JournalLine(
-        seq=seq,
-        ts=datetime(2026, 10, 7, 5, 48, 8, 123456, tzinfo=timezone.utc),
-        run_id=RUN_ID,
-        event="attempt_upsert",
-        story="story-a",
-        card="card-a",
-        phase="implement",
-        attempt=1,
-        payload={"status": "started", "n": 1},
-    )
+# -- ts_text: how a line writes its ts -------------------------------------------
 
 
 def test_ts_text_is_how_a_journal_line_writes_its_ts():
@@ -777,43 +422,6 @@ def test_ts_text_is_how_a_journal_line_writes_its_ts():
             store_journal.JournalLine(seq=1, ts=text, run_id=RUN_ID, event="run_upsert")
             == line
         )
-
-
-def test_mirror_writes_the_given_line_verbatim(repo):
-    journal = store_journal.Journal(RUN_ID)
-    line = _mirrored_line(7)
-
-    journal.mirror(line)
-
-    assert journal.path.read_text(encoding="utf-8") == (
-        json.dumps(line.model_dump(mode="json"), sort_keys=True) + "\n"
-    )
-    assert journal.read() == [line]
-
-
-def test_append_numbers_after_a_mirrored_line(repo):
-    journal = store_journal.Journal(RUN_ID)
-
-    journal.mirror(_mirrored_line(5))
-    assert journal.append("run_upsert", {"i": 0}).seq == 6
-
-    journal.mirror(_mirrored_line(3))
-    assert journal.append("run_upsert", {"i": 1}).seq == 7
-
-
-def test_a_failed_mirror_write_raises_and_releases_the_lock(repo, monkeypatch):
-    journal = store_journal.Journal(RUN_ID)
-
-    def failing_fsync(fd: int) -> None:
-        raise OSError("fsync failed")
-
-    monkeypatch.setattr(store_journal.os, "fsync", failing_fsync)
-
-    with pytest.raises(OSError, match="fsync failed"):
-        journal.mirror(_mirrored_line(4))
-
-    assert journal._lock.locked() is False
-    assert [line.seq for line in journal.read()] == [4]
 
 
 # -- read_verbatim: a journal as `am migrate` imports it (single-store 1.3.2 D4)

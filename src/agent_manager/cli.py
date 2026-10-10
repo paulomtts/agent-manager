@@ -45,7 +45,6 @@ from agent_manager import (
     detach,
     dispatch,
     export,
-    journal_check,
     locks,
     migrate,
     models,
@@ -1420,7 +1419,7 @@ def dry_run_milestone(
     """O3's order: repo dir, roots, milestone, tree, census, then the payload.
 
     Read-only by construction. The two `brd` reads are its only I/O. No
-    `Store` is opened (that would mint a run directory), no runner is built,
+    `Store` is opened (that would write `am.db`), no runner is built,
     and nothing is fetched, pruned, branched, merged or written to the board.
     The Integrate plan is derived, never run. Every refusal is a type already in `HANDLED`.
     """
@@ -1590,10 +1589,10 @@ refusal, not a bug; nothing below the CLI catches it. `store_leases.LeaseLostErr
 is in it because another process took this run's lease over mid-walk (spec X4):
 the fence stopped every write, and the operator gets the envelope naming the new
 holder. It is a `BaseException`, so it has to be listed by name.
-`store_journal.CorruptJournalError` is in it because a crashed run can leave a
-torn line in its journal, and `Store.open` reading it (`am reset`, `am resume`)
-is a refusal naming the file and line, not a bug; only that subclass, not
-`JournalError` as a whole. `store_db.StoreSchemaError` is in it because an
+`store_journal.CorruptJournalError` is kept in it, a refusal naming the file
+and line rather than a bug, until `store.journal` is reduced; no command raises
+it now that `Store.open` reads no journal file. Only that subclass is listed,
+not `JournalError` as a whole. `store_db.StoreSchemaError` is in it because an
 `am.db` written by a newer `am` is a refusal naming the file and both versions,
 not a bug. `store_db.MigrationRequiredError` is in it because every command
 that opens the projection refuses, naming `am migrate`, on a machine whose
@@ -3966,9 +3965,9 @@ def resume_run(
 
     The order is load-bearing in the same way `run_card`'s is, only inverted:
     every refusal -- unknown run, nothing in flight, a card the board lost --
-    happens before `Store.open`, because `Store.open` constructs a `Journal`
-    and therefore mints a run directory, and a refusal that left one behind
-    would be this command writing state for a run it declined to touch.
+    happens before `Store.open`, which writes `am.db` (it resolves the project
+    row), and a refusal that wrote anything would be this command writing
+    state for a run it declined to touch.
 
     Branch, base branch and worktree come from the recorded run and never
     from a flag: §9's "the run records what it was started with" is the
@@ -4319,11 +4318,11 @@ def request_control(
 
     One `BEGIN IMMEDIATE` transaction covers the refusals, the idempotence
     check, the insert and its `control_requested` event (`ts` the request's
-    clock, never mirrored to a journal file), so two requesters cannot both
-    insert and a refusal or a failed event insert leaves no row. A no-op
-    request inserts neither. The project is looked up, never created, so a
-    refusal creates no `projects` row either. The process holding the lease
-    applies the request at its next poll; this function only records it.
+    clock), so two requesters cannot both insert and a refusal or a failed
+    event insert leaves no row. A no-op request inserts neither. The project
+    is looked up, never created, so a refusal creates no `projects` row
+    either. The process holding the lease applies the request at its next
+    poll; this function only records it.
     SQLite is the only channel (C1).
     """
     if command not in CONTROL_COMMANDS:
@@ -4472,8 +4471,8 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
                 f"run {run_id!r} is not in the projection for {root}"
                 " (`agent-manager runs` lists the ones that are)"
             )
-        # Unknown, live, done: read-only and before `Store.open`, which would
-        # mint a run directory, so a refusal leaves nothing behind (§3.4).
+        # Unknown, live, done: read-only and before `Store.open`, which writes
+        # `am.db`, so a refusal leaves nothing behind (§3.4).
         lease = store_leases.read_lease(conn, run.id)
         now = _utcnow()
         if lease is not None and control.lease_is_live(lease, now=now):
@@ -4618,26 +4617,3 @@ def export_command(
         typer.echo("".join(f"{text}\n" for text in lines), nl=False)
         return
     typer.echo(render(ok_envelope(asdict(result)), pretty=pretty))
-
-
-@app.command("journal-check")
-def journal_check_command(
-    run_id: str | None = typer.Argument(
-        None, metavar="[RUN]", help="The run to check; or give --all."
-    ),
-    all_runs: bool = typer.Option(
-        False, "--all", help="Check every run in am.db or with a journal file."
-    ),
-    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
-) -> None:
-    """Compare each run's `events` with its `journal.jsonl` and report every
-    difference, changing nothing; a run live meanwhile can show its in-flight
-    tail as a transient difference."""
-    try:
-        if (run_id is not None) == all_runs:
-            raise CliError("give exactly one of RUN and --all")
-        report = journal_check.check(run_id)
-    except HANDLED as error:
-        typer.echo(render(error_envelope(error), pretty=pretty))
-        raise typer.Exit(EXIT_ERROR) from None
-    typer.echo(render(ok_envelope(asdict(report)), pretty=pretty))

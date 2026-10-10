@@ -1,11 +1,10 @@
-"""A run's append-only JSONL journal: the line envelope, its event kinds,
-appending and reading the file, and reading it verbatim for `am migrate`."""
+"""A run's JSONL journal: the line envelope, its event kinds, reading a
+journal file, and reading it verbatim for `am migrate`. `am` no longer writes
+journal files; the files an older `am` wrote are read, never changed."""
 
 import json
-import os
-import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, get_args
 
@@ -88,10 +87,11 @@ them."""
 class _UnknownEventLine(BaseModel):
     """What a line with an unrecognised `event` must still carry: its `seq`.
 
-    A newer `am` may journal an event kind this version's `EventKind` does not
-    list. `Journal.read` skips such a line, but `last_seq` still counts it, so
-    a later `append` never reuses a number already on disk. Every other field
-    belongs to a schema this version does not know and is ignored.
+    A newer `am` may have journalled an event kind this version's `EventKind`
+    does not list. `Journal.read` skips such a line, but only one that still
+    carries a positive `seq`: a line with no usable `seq` is an error whatever
+    its event. Every other field belongs to a schema this version does not
+    know and is ignored.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -100,47 +100,16 @@ class _UnknownEventLine(BaseModel):
 
 
 class Journal:
-    """Append-only JSONL log for one run.
+    """A reader of one run's journal file, `<data dir>/runs/<run_id>/journal.jsonl`,
+    as an older `am` wrote it.
 
-    The threads of the process that holds a run's lease share one `Journal`;
-    a lock serialises writes from those threads. Live lines arrive through
-    `mirror`, already numbered by the store from its `events` table. `append`
-    numbers a line itself, one past the highest `seq` this journal has seen:
-    on disk when it was opened, or written since through `append` or `mirror`.
+    Constructing one creates nothing and reads nothing, so a missing, torn or
+    corrupt file raises only from `read`.
     """
 
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
-        self.path = paths.run_dir(run_id) / JOURNAL_NAME
-        self._lock = threading.Lock()
-        self._seq = self.last_seq()
-
-    @classmethod
-    def _for_reading(cls, run_id: str) -> "Journal":
-        """Another run's journal, opened only to be read.
-
-        `__init__` scans the file for its highest `seq` with the default
-        `read()`, which would raise on the very torn tail
-        `read(ignore_torn_tail=True)` exists to tolerate, and `paths.run_dir`
-        would create a directory for a run that never existed. This instance
-        is never appended to, so it needs neither: `_seq` stays 0.
-        """
-        journal = cls.__new__(cls)
-        journal.run_id = run_id
-        journal.path = paths.data_path() / "runs" / run_id / JOURNAL_NAME
-        journal._lock = threading.Lock()
-        journal._seq = 0
-        return journal
-
-    def last_seq(self) -> int:
-        """Highest sequence number already on disk, or 0 for a fresh journal.
-
-        Counts lines `read` skips for an unrecognised `event` too: they are on
-        disk, so `append` must never number a line with one of their `seq`s.
-        """
-        if not self.path.exists():
-            return 0
-        return max((seq for seq, _ in self._scan()), default=0)
+        self.path = paths.data_path() / "runs" / run_id / JOURNAL_NAME
 
     def _scan(
         self, *, ignore_torn_tail: bool = False
@@ -148,21 +117,20 @@ class Journal:
         """Every non-blank line's `seq`, in file order, with its `JournalLine`.
 
         The `JournalLine` is `None` for a line whose `event` is a string this
-        version's `EventKind` does not list: `read` skips it, but `last_seq`
-        still counts its `seq`. Such a line must still carry a positive `seq`;
-        everything else on it is ignored. Any other line is validated strictly
-        as a `JournalLine`, so a missing or non-string `event`, a non-object
-        line, or an unknown envelope key on a known event still raises.
+        version's `EventKind` does not list: `read` skips it. Such a line must
+        still carry a positive `seq`; everything else on it is ignored. Any
+        other line is validated strictly as a `JournalLine`, so a missing or
+        non-string `event`, a non-object line, or an unknown envelope key on a
+        known event still raises.
 
-        Blank lines are skipped: a crash between the write and the flush can
+        Blank lines are skipped: a crash between the write and the flush could
         leave one. Anything else that is not JSON is an error naming the line.
 
-        `ignore_torn_tail` is for reading *another* run's journal, which a
-        process elsewhere may be appending to right now: a final line that is
-        not JSON and has no trailing newline is that append in flight, and is
-        skipped. A non-JSON line that is newline-terminated, or that is not the
-        last, is still `CorruptJournalError`. Lines are ASCII (`json.dumps`
-        escapes), so a cut can never split a character.
+        With `ignore_torn_tail`, a final line that is not JSON and has no
+        trailing newline -- an append cut short -- is skipped. A non-JSON line
+        that is newline-terminated, or that is not the last, is still
+        `CorruptJournalError`. Lines are ASCII (`json.dumps` escapes), so a
+        cut can never split a character.
         """
         if not self.path.exists():
             raise MissingJournalError(
@@ -198,84 +166,16 @@ class Journal:
     def read(self, *, ignore_torn_tail: bool = False) -> list[JournalLine]:
         """Every line whose event this version knows, validated, in `seq` order.
 
-        A line whose `event` is a string outside `EventKind` (written by a
-        newer `am`) is skipped rather than raising; see `_scan` for what is
-        still an error and for `ignore_torn_tail`. Unknown keys inside a known
-        line's `payload` pass through untouched: `replay` judges payloads.
-
-        Holds the append lock across the scan, so a line this journal is
-        appending is never met half-written. The lock is not re-entrant: never
-        call this while holding it.
+        No file raises `MissingJournalError`. A line whose `event` is a string
+        outside `EventKind` (written by a newer `am`) is skipped rather than
+        raising; see `_scan` for what is still an error and for
+        `ignore_torn_tail`. Unknown keys inside a known line's `payload` pass
+        through untouched: `replay` judges payloads.
         """
-        with self._lock:
-            scanned = self._scan(ignore_torn_tail=ignore_torn_tail)
+        scanned = self._scan(ignore_torn_tail=ignore_torn_tail)
         lines = [line for _, line in scanned if line is not None]
         lines.sort(key=lambda line: line.seq)
         return lines
-
-    def append(
-        self,
-        event: EventKind,
-        payload: dict[str, Any],
-        *,
-        story: str | None = None,
-        card: str | None = None,
-        phase: str | None = None,
-        attempt: int | None = None,
-    ) -> JournalLine:
-        """Append one line, flushed and fsynced before returning.
-
-        The sequence number is one past the cached highest `seq` (read when
-        the journal is opened, and raised by every `append` and `mirror`
-        since), not re-read from disk on each append, and the lock is held
-        from numbering the line until it is fsynced, so the threads of this
-        process never share a number or interleave their bytes. The cached
-        number advances once the line has been written and flushed to the
-        file; if validation, the open or the write raises, the next append
-        retries the same number, and if only the fsync raises the number stays
-        spent, so no seq is ever repeated on disk by this journal. The lock is
-        released either way.
-        """
-        with self._lock:
-            seq = self._seq + 1
-            line = JournalLine(
-                seq=seq,
-                ts=datetime.now(timezone.utc),
-                run_id=self.run_id,
-                event=event,
-                story=story,
-                card=card,
-                phase=phase,
-                attempt=attempt,
-                payload=payload,
-            )
-            text = json.dumps(line.model_dump(mode="json"), sort_keys=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(text + "\n")
-                handle.flush()
-                # The line is in the file now, fsynced or not: spend its number
-                # so a retry after a failed fsync cannot repeat it on disk.
-                self._seq = seq
-                os.fsync(handle.fileno())
-            return line
-
-    def mirror(self, line: JournalLine) -> None:
-        """Append `line` exactly as given, flushed and fsynced before returning.
-
-        The bytes are those `append` writes for the same fields. `line.seq`
-        is written as given: nothing is numbered and the clock is not read.
-        Once the line is written and flushed, the cached highest `seq` becomes
-        the larger of itself and `line.seq`, so a later `append` numbers after
-        it. Whatever the open, the write, the flush or the fsync raises
-        propagates; the lock is released either way.
-        """
-        text = json.dumps(line.model_dump(mode="json"), sort_keys=True)
-        with self._lock:
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(text + "\n")
-                handle.flush()
-                self._seq = max(self._seq, line.seq)
-                os.fsync(handle.fileno())
 
 
 _ENVELOPE_KEYS: frozenset[str] = frozenset(JournalLine.model_fields)

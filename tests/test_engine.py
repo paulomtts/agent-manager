@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import eventlines
 
 from agent_manager import dispatch, models, results
 from agent_manager.store import db as store_db
@@ -364,7 +365,7 @@ def _workflow(document, functions: dict[str, Any]) -> phase_model.Workflow:
 def _journalled_phases(opened) -> list[tuple[str | None, str]]:
     return [
         (line.phase, line.payload["status"])
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert"
     ]
 
@@ -513,8 +514,8 @@ def test_every_state_edge_is_journalled_before_the_row_is_written(store, run_sub
         ("beta", "done"),
     ]
     assert _projected_phases(store) == [("alpha", "done"), ("beta", "done")]
-    assert [line.event for line in store.journal.read()][-1] == "subtask_upsert"
-    assert store.journal.read()[-1].payload["status"] == "done"
+    assert [line.event for line in eventlines.run_lines(store.run_id)][-1] == "subtask_upsert"
+    assert eventlines.run_lines(store.run_id)[-1].payload["status"] == "done"
 
 
 def test_no_attempt_row_is_written_for_a_deterministic_phase(store, run_subtask):
@@ -529,7 +530,7 @@ def test_no_attempt_row_is_written_for_a_deterministic_phase(store, run_subtask)
     )
 
     assert store.connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
-    assert not any(line.event == "attempt_upsert" for line in store.journal.read())
+    assert not any(line.event == "attempt_upsert" for line in eventlines.run_lines(store.run_id))
 
 
 def test_a_phase_named_like_a_context_key_runs_but_never_clobbers_it(store, run_subtask):
@@ -597,8 +598,8 @@ def test_a_raising_step_escalates_and_the_exception_does_not_propagate(store, ru
     assert "disk went away" in summary.detail
     assert _journalled_phases(store) == [("alpha", "started"), ("alpha", "failed")]
     assert _projected_phases(store) == [("alpha", "failed")]
-    assert store.journal.read()[-1].event == "subtask_upsert"
-    assert store.journal.read()[-1].payload["status"] == "escalated"
+    assert eventlines.run_lines(store.run_id)[-1].event == "subtask_upsert"
+    assert eventlines.run_lines(store.run_id)[-1].payload["status"] == "escalated"
 
 
 def test_a_binding_failure_escalates_without_calling_the_step(store, run_subtask):
@@ -739,7 +740,7 @@ def test_a_failing_gate_escalates_and_stops_the_walk(store, run_subtask):
     assert "alpha_gate" in summary.detail
     assert "2 of 3 commands failed" in summary.detail
     assert _journalled_phases(store) == [("alpha", "started"), ("alpha", "failed")]
-    assert store.journal.read()[-1].payload["status"] == "escalated"
+    assert eventlines.run_lines(store.run_id)[-1].payload["status"] == "escalated"
 
 
 def test_a_warning_before_a_failing_gate_survives_into_the_summary(store, run_subtask):
@@ -976,7 +977,7 @@ def test_a_best_effort_failure_warns_and_does_not_sink_the_subtask(store, run_su
         ("work", "done"),
         ("mark_done", "done"),
     ]
-    assert store.journal.read()[-1].payload["status"] == "done"
+    assert eventlines.run_lines(store.run_id)[-1].payload["status"] == "done"
 
 
 def test_a_best_effort_phase_with_a_failing_gate_only_warns(store, run_subtask):
@@ -1242,7 +1243,7 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store, run_subt
 def _journalled_details(opened) -> list[tuple[str | None, str, str | None]]:
     return [
         (line.phase, line.payload["status"], line.payload["detail"])
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert"
     ]
 
@@ -1435,7 +1436,7 @@ def test_a_phase_is_timed_with_the_injected_clock(store, run_subtask):
 
     stamped = [
         (line.phase, line.payload["status"], line.payload["started_at"], line.payload["ended_at"])
-        for line in store.journal.read()
+        for line in eventlines.run_lines(store.run_id)
         if line.event == "phase_upsert"
     ]
     assert stamped == [
@@ -1460,7 +1461,7 @@ def test_the_default_clock_stamps_an_aware_utc_time(store, run_subtask):
     )
 
     after = datetime.now(timezone.utc)
-    done = store.journal.read()[-2]
+    done = eventlines.run_lines(store.run_id)[-2]
     assert done.payload["status"] == "done"
     started_at = datetime.fromisoformat(done.payload["started_at"])
     ended_at = datetime.fromisoformat(done.payload["ended_at"])
@@ -1897,7 +1898,7 @@ def test_a_failed_agent_phase_escalates_the_subtask_and_stops(store, run_subtask
     assert summary.results == {}
     subtasks = [
         line.payload["status"]
-        for line in store.journal.read()
+        for line in eventlines.run_lines(store.run_id)
         if line.event == "subtask_upsert"
     ]
     assert subtasks == ["escalated"]
@@ -2348,7 +2349,7 @@ def STOP_MIXED(fn: dict[str, Any]) -> phase_model.Workflow:
 def _subtask_journal_statuses(opened) -> list[str]:
     return [
         line.payload["status"]
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "subtask_upsert"
     ]
 

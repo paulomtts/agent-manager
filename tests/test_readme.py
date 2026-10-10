@@ -959,7 +959,13 @@ def test_data_directory_notes():
     ):
         assert name in section, name
     assert "read only by `am migrate`" in section
-    assert "still appends to but no longer reads" in section
+    lines = section.splitlines()
+    runs_bullet = next(line for line in lines if line.startswith("- `runs/<run-id>/`"))
+    assert "journal.jsonl" not in runs_bullet
+    legacy_journal = next(
+        line for line in lines if line.startswith("- legacy `runs/<run-id>/journal.jsonl`")
+    )
+    assert "read only by `am migrate`" in legacy_journal
     anchors = _assert_anchors_resolve(section)
     assert "several-am-processes" in anchors
     assert _slug(MIGRATE_TITLE) in anchors
@@ -1013,7 +1019,7 @@ def test_backup_and_restore_section():
     assert "No `am.db-wal` or `am.db-shm` may remain beside it." in numbered[2]
     assert "`store_id` is the one the backup was taken with" in section
     assert "possibly lower than before" in section
-    assert "`am journal-check`" in section
+    assert "Events recorded after the backup are not in it." in section
     assert RESNAPSHOT in section
     assert "`am resume` takes it over" in section
 
@@ -1023,6 +1029,57 @@ def test_backup_and_restore_section():
     assert heads[titles.index(BACKUP_TITLE)][1] == 3
     assert _slug(BACKUP_TITLE) == "backing-up-and-restoring-amdb"
     assert "several-am-processes" in _assert_anchors_resolve(section)
+
+
+def test_readme_names_no_journal_checker():
+    text = README.read_text()
+
+    assert "journal-check" not in text
+    assert "journal_check" not in text
+
+
+STALE_JOURNAL_CLAIMS = (
+    "still appends",
+    "a mirror of the run's",
+    "as a run's `journal.jsonl` file holds it",
+    "For a line `am` also wrote",
+    "the way `am` writes a `journal.jsonl` line",
+    "one journal per milestone",
+    "`<data dir>/runs/<run-id>/journal.jsonl` and lease",
+    "journal head line",
+    "not even the journal line",
+    "no journal of its own",
+    "its own journal",
+)
+JOURNAL_FILE_MARKERS = (
+    "older `am`",
+    "`am migrate`",
+    "legacy",
+    "never",
+    "not in a",
+    "not read",
+    "any run's",
+)
+
+
+def test_readme_never_says_am_writes_a_journal():
+    text = README.read_text(encoding="utf-8")
+    for claim in STALE_JOURNAL_CLAIMS:
+        assert claim not in text, claim
+    for line in _lines():
+        if "journal.jsonl" in line:
+            assert any(marker in line for marker in JOURNAL_FILE_MARKERS), line
+
+
+BOARD_TITLE = "Running every open milestone with `--board`"
+
+
+def test_board_section_counts_runs_not_journals():
+    section = _section(BOARD_TITLE)
+    paragraph = _paragraph("One run per milestone.")
+    assert paragraph in section
+    assert "`am.db`" in paragraph or "events" in paragraph
+    assert "journal" not in section
 
 
 SNAPSHOTS_TITLE = "Snapshots and cursors"
@@ -1196,7 +1253,7 @@ def test_stream_section_cursors_by_gseq():
     assert "Cursor by `gseq`" in section
     assert "pass the highest `gseq` you have seen as `--since-seq`" in section
     assert "`(run_id, seq)` with `--since` still works" in section
-    assert "in a `journal.jsonl` file you read yourself" in section
+    assert "in a `journal.jsonl` file an older `am` wrote" in section
     assert WATCH_SCHEMA_NOTE in section.splitlines()
     assert _slug(SNAPSHOTS_TITLE) in _assert_anchors_resolve(section)
 
